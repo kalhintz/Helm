@@ -769,3 +769,6 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .cx-quick-btn { font-size: 10.5px; font-weight: 600; color: var(--muted); background: var(--secondary); border: 1px solid var(--border); border-radius: var(--r-pill); padding: 2px 9px; cursor: pointer; transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast); }
 .cx-quick-btn:hover { color: var(--text); border-color: var(--border-strong); background: var(--panel-hi); }
 .cx-quick-btn:active { transform: translateY(0.5px); }
+.cx-quick-menu { position: fixed; z-index: 200; background: var(--card-bg); border: 1px solid var(--border-strong); border-radius: var(--r-md); box-shadow: var(--shadow-pop); padding: 4px; display: flex; flex-direction: column; min-width: 130px; }
+.cx-quick-mi { text-align: left; font-size: 12px; color: var(--text-dim); background: transparent; border: none; border-radius: var(--r-sm); padding: 6px 10px; cursor: pointer; }
+.cx-quick-mi:hover { background: var(--accent-soft); color: var(--text); }

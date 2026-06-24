@@ -92,9 +92,23 @@
   const AGENT_ORDER = ["claude", "codex", "opencode", "pwsh", "cmd", "wsl"];
   // Quick-change controls above the composer — each click injects the agent's own
   // slash command so its native picker (model / reasoning effort / agent) opens.
+  // A control is either { cmd } (sends a slash command, opening the agent's own
+  // picker) or { menu:[{label,cmd}] } (a Helm dropdown — pick an item to change
+  // directly). Claude's /model takes the name as an argument, so we list models
+  // and switch in one click; codex/opencode have no direct setter, so those open
+  // the native picker.
   const AGENT_CMDS = {
-    claude:   [{ label: "모델", cmd: "/model" }, { label: "에이전트", cmd: "/agents" }],
-    codex:    [{ label: "모델·추론", cmd: "/model" }, { label: "승인", cmd: "/approvals" }],
+    claude: [
+      { label: "모델", menu: [
+        { label: "Default", cmd: "/model default" },
+        { label: "Opus", cmd: "/model opus" },
+        { label: "Opus Plan", cmd: "/model opusplan" },
+        { label: "Sonnet", cmd: "/model sonnet" },
+        { label: "Haiku", cmd: "/model haiku" },
+      ] },
+      { label: "에이전트", cmd: "/agents" },
+    ],
+    codex: [{ label: "모델·추론", cmd: "/model" }, { label: "승인", cmd: "/approvals" }],
     opencode: [{ label: "모델", cmd: "/models" }, { label: "에이전트", cmd: "/agent" }],
   };
   const statusLabel = (st) => ({ spawning: "시작 중", running: "실행 중", active: "실행 중", attention: "입력 대기", idle: "대기", error: "오류", exited: "종료" }[st] || st);
@@ -723,21 +737,41 @@
       fileChips.innerHTML = `<a class="cx-file-chip">${escapeHtml(session.cwd || "")}</a>`;
     }
   }
+  function sendCmd(cmd) {
+    const s = activeSession();
+    if (s && s.ptyId != null) {
+      invoke("pty_write", { id: s.ptyId, data: cmd + "\r" });
+      if (s.term) { try { s.term.focus(); } catch (_) {} }
+    }
+  }
+  function openQuickMenu(anchor, items) {
+    document.querySelectorAll(".cx-quick-menu").forEach((m) => m.remove());
+    const menu = el("div", "cx-quick-menu");
+    items.forEach((it) => {
+      const mi = el("button", "cx-quick-mi", it.label);
+      mi.addEventListener("click", () => { menu.remove(); sendCmd(it.cmd); });
+      menu.appendChild(mi);
+    });
+    document.body.appendChild(menu);
+    const r = anchor.getBoundingClientRect();
+    menu.style.left = r.left + "px";
+    menu.style.bottom = (window.innerHeight - r.top + 5) + "px";
+    const close = (e) => { if (!menu.contains(e.target) && e.target !== anchor) { menu.remove(); document.removeEventListener("mousedown", close); } };
+    setTimeout(() => document.addEventListener("mousedown", close), 0);
+  }
   function renderQuickControls(session) {
     const wrap = $("#cx-quick");
     if (!wrap) return;
     wrap.innerHTML = "";
     const cmds = (session && AGENT_CMDS[session.agent]) || [];
     cmds.forEach((c) => {
-      const b = el("button", "cx-quick-btn", c.label);
-      b.title = c.cmd + " 보내기";
-      b.addEventListener("click", () => {
-        const s = activeSession();
-        if (s && s.ptyId != null) {
-          invoke("pty_write", { id: s.ptyId, data: c.cmd + "\r" });
-          if (s.term) { try { s.term.focus(); } catch (_) {} }
-        }
-      });
+      const b = el("button", "cx-quick-btn", c.menu ? (c.label + " ▾") : c.label);
+      if (c.menu) {
+        b.addEventListener("click", (e) => { e.stopPropagation(); openQuickMenu(b, c.menu); });
+      } else {
+        b.title = c.cmd + " 보내기";
+        b.addEventListener("click", () => sendCmd(c.cmd));
+      }
       wrap.appendChild(b);
     });
   }

@@ -4,6 +4,43 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.2.0] — 2026-06-24
+
+Live agent state goes from log-tailing to native hooks, plus a redesigned tasks
+board and a much richer composer.
+
+### Added
+
+- **Native-hook progress pipeline** — Helm runs a localhost receiver and gives
+  each agent its own hook so progress / activity / **completion** push instantly
+  with zero polling. Claude (project `.claude/settings.local.json`, never the
+  global config) and opencode (an auto-loaded `~/.config/opencode/plugin/`
+  bridge) are wired; Codex stays on the watcher.
+- **Tasks board ("작업")** — reframed into a "현재 활성" overview: one card per
+  running session with status, live activity, a per-second elapsed timer, and a
+  context-usage bar. Codex `update_plan` and the OMC `TaskCreate`/`TaskUpdate`
+  harness now feed the task list alongside Claude `TodoWrite`.
+- **Keyboard shortcuts** — session nav (cycle / jump / new / close), Terminal ⇄
+  Conversation, clear scrollback, font size, settings, notifications.
+- **Composer quick controls** — model / agent / reasoning chips above the send
+  button; Claude's model dropdown switches the model in one click.
+- A session tab now shows an attention ring when its agent needs input.
+
+### Changed
+
+- Log watchers wake on filesystem events instead of polling, and bind to the
+  exact transcript a hook reports — fixing Claude token-context tracking.
+- Clipboard paste reads the real OS clipboard (text copied in other apps).
+
+### Fixed
+
+- Codex status was pinned to idle (wrong turn-event name) — it now shows live
+  "working" + what it's doing.
+- The agent watcher failed to start for restored / Helm-launched sessions, so
+  progress / tasks / conversation stayed empty.
+- `Ctrl`/`Cmd`+`C` copies the terminal selection (and still interrupts with no
+  selection).
+
 ## [0.1.0] — 2026-06-24
 
 First public release. A native, cross-platform dashboard terminal that runs AI
@@ -46,4 +83,5 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.2.0]: https://github.com/kalhintz/Helm/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kalhintz/Helm/releases/tag/v0.1.0
