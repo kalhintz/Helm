@@ -373,7 +373,13 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
         let sig = state.signature(&prog);
         if sig != last_sig {
             last_sig = sig;
-            let _ = app.emit(&evt, &prog);
+            // Once native hooks are live for this pty they own status/activity/todos;
+            // the watcher then contributes only token context (and conversation).
+            if crate::hook_server::hooks_active(&app, pty_id) {
+                let _ = app.emit(&evt, serde_json::json!({ "context": prog.context }));
+            } else {
+                let _ = app.emit(&evt, &prog);
+            }
         }
     }
 }
@@ -885,7 +891,13 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
         let sig = state.signature(&prog);
         if sig != last_sig {
             last_sig = sig;
-            let _ = app.emit(&evt, &prog);
+            // Once native hooks are live for this pty they own status/activity/todos;
+            // the watcher then contributes only token context (and conversation).
+            if crate::hook_server::hooks_active(&app, pty_id) {
+                let _ = app.emit(&evt, serde_json::json!({ "context": prog.context }));
+            } else {
+                let _ = app.emit(&evt, &prog);
+            }
         }
     }
 }
@@ -1235,7 +1247,13 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
         let sig = state.signature(&prog);
         if sig != last_sig {
             last_sig = sig;
-            let _ = app.emit(&evt, &prog);
+            // Once native hooks are live for this pty they own status/activity/todos;
+            // the watcher then contributes only token context (and conversation).
+            if crate::hook_server::hooks_active(&app, pty_id) {
+                let _ = app.emit(&evt, serde_json::json!({ "context": prog.context }));
+            } else {
+                let _ = app.emit(&evt, &prog);
+            }
         }
     }
 }

@@ -3,6 +3,7 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
 mod agent_watch;
+mod hook_server;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -249,6 +250,20 @@ fn system_stats(stats: State<StatsCache>) -> SystemStats {
 /// launched claude/codex/opencode inside a plain shell session.
 #[tauri::command]
 fn start_agent_watch(app: AppHandle, id: u32, agent: String, cwd: String) {
+    // route this cwd's hook events to this pty, and register the agent's hook so
+    // it pushes events to us instantly.
+    hook_server::register_session(&app, id, &cwd);
+    if agent == "claude" {
+        let port = app
+            .try_state::<hook_server::HookHub>()
+            .map(|h| *h.port.lock().unwrap())
+            .unwrap_or(0);
+        if port != 0 {
+            if let Some(fwd) = hook_server::forwarder_path().to_str() {
+                hook_server::register_claude(&cwd, port, fwd);
+            }
+        }
+    }
     agent_watch::start(app, id, agent, cwd);
 }
 
@@ -402,7 +417,18 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(PtyState::default())
+        .manage(hook_server::HookHub::default())
         .setup(|app| {
+            // Native-hook receiver: agents POST lifecycle events here for instant
+            // progress/tasks/completion (see hook_server). Falls back silently to
+            // the transcript watchers when an agent has no hook registered.
+            {
+                let port = hook_server::start(app.handle().clone());
+                if let Some(hub) = app.try_state::<hook_server::HookHub>() {
+                    *hub.port.lock().unwrap() = port;
+                }
+                hook_server::write_forwarder(port);
+            }
             // System-stats cache refreshed off the request path (sysinfo, cross-
             // platform) so the command never does blocking work inside the IPC loop.
             app.manage(StatsCache::default());
