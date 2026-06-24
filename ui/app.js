@@ -294,7 +294,12 @@
       const isV = e.key === "v" || e.key === "V";
       const isC = e.key === "c" || e.key === "C";
       if ((e.ctrlKey && isV) || (e.metaKey && isV) || (e.shiftKey && e.key === "Insert")) {
-        clipReadText().then((t) => { if (t) term.paste(t); });
+        // An image on the clipboard (opencode/Claude image-paste) wins: Helm saves
+        // it to a temp PNG and pastes the path so the agent attaches it. Otherwise
+        // fall back to a normal text paste.
+        invoke("paste_clipboard_image")
+          .then((p) => { if (p) term.paste(p); else return clipReadText().then((t) => { if (t) term.paste(t); }); })
+          .catch(() => clipReadText().then((t) => { if (t) term.paste(t); }));
         return false;
       }
       if (isC && (e.ctrlKey || e.metaKey) && term.hasSelection()) {
@@ -1087,8 +1092,20 @@
       const lbl = pill.querySelector(".conn-label");
       if (lbl) lbl.textContent = v === "connected" ? "Connected" : v === "error" ? "Disconnected" : "Connecting";
     }
-    const chip = $("#chip-conn");
-    if (chip) chip.style.display = v === "connected" ? "" : "none";
+  }
+
+  // Light the wifi indicator while one or more phones are linked over the LAN.
+  function setMobileClients(count) {
+    const n = Math.max(0, count | 0);
+    const wifi = $("#tb-wifi");
+    const mob = $("#tb-mobile");
+    if (wifi) {
+      wifi.hidden = n === 0;
+      wifi.title = n === 0 ? "" : (n === 1 ? "모바일 연결됨" : `모바일 ${n}대 연결됨`);
+      const nb = $("#tb-wifi-n");
+      if (nb) nb.textContent = n > 1 ? String(n) : "";
+    }
+    if (mob) mob.classList.toggle("linked", n > 0);
   }
 
   function renderHeaderChips() {
@@ -1627,6 +1644,8 @@
     startUptimeTicker();
     applySettings();
     startUsagePolling();
+    setMobileClients(0);
+    try { listen("mobile-clients", (e) => setMobileClients((e.payload && e.payload.count) || 0)); } catch (_) {}
 
     let home = "";
     try { home = await invoke("app_home"); } catch (_) {}

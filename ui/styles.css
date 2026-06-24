@@ -160,6 +160,18 @@ body {
   transition: color var(--t-fast), background var(--t-fast);
 }
 .tb-icon:hover { color: var(--text); background: #1b1f25; }
+/* mobile linked: the 📱 button glows green while a phone is connected */
+.tb-icon.linked { color: var(--green); }
+/* wifi pill — only shown while at least one phone is linked over the LAN */
+.tb-wifi {
+  display: inline-flex; align-items: center; gap: 2px;
+  height: 22px; padding: 0 7px; border-radius: var(--r-sm);
+  color: var(--green); background: var(--green-soft);
+  border: 1px solid rgba(63,185,80,0.35);
+  font-size: var(--fs-12); line-height: 1;
+}
+.tb-wifi[hidden] { display: none; }
+.tb-wifi b { font-weight: 600; font-size: 11px; }
 .tb-unread {
   position: absolute; top: 2px; right: 2px;
   min-width: 14px; height: 14px; padding: 0 3px;

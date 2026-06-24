@@ -44,6 +44,9 @@ fn ws_port() -> u16 {
 #[derive(Default)]
 pub struct Bus {
     clients: Mutex<Vec<Sender<String>>>,
+    /// Live phone count (incremented after handshake, decremented on disconnect) —
+    /// drives the desktop's mobile-link (wifi) indicator.
+    active: std::sync::atomic::AtomicUsize,
 }
 
 impl Bus {
@@ -57,9 +60,13 @@ impl Bus {
         let mut g = self.clients.lock().unwrap();
         g.retain(|tx| tx.send(text.clone()).is_ok());
     }
-    #[allow(dead_code)]
-    fn client_count(&self) -> usize {
-        self.clients.lock().unwrap().len()
+    fn client_connected(&self) -> usize {
+        self.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+    fn client_disconnected(&self) -> usize {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_sub(1)
     }
 }
 
@@ -387,6 +394,13 @@ fn ws_session(app: AppHandle, mut stream: TcpStream, token: String) -> std::io::
         None => return Ok(()),
     };
     let mut writer = stream.try_clone()?;
+
+    // this phone is now live — light the desktop's wifi indicator
+    if let Some(bus) = app.try_state::<Bus>() {
+        let n = bus.client_connected();
+        let _ = app.emit("mobile-clients", json!({ "count": n }));
+    }
+
     let writer_thread = std::thread::spawn(move || {
         // initial hello so the client knows it's live
         let _ = write_text_frame(&mut writer, &json!({ "event": "mobile-hello", "payload": {} }).to_string());
@@ -401,6 +415,12 @@ fn ws_session(app: AppHandle, mut stream: TcpStream, token: String) -> std::io::
     let result = ws_read_loop(&app, &mut stream);
     drop(stream); // unblock writer's socket on close
     let _ = writer_thread.join();
+
+    // phone gone — update the desktop indicator
+    if let Some(bus) = app.try_state::<Bus>() {
+        let n = bus.client_disconnected();
+        let _ = app.emit("mobile-clients", json!({ "count": n }));
+    }
     result
 }
 

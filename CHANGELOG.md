@@ -4,6 +4,22 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.5.0] — 2026-06-24
+
+### Added
+
+- **Image paste into the terminal** — when the clipboard holds an image (not
+  text), `Ctrl`/`Cmd`+`V` saves it to a temp PNG and pastes the path, so agents
+  like opencode and Claude Code attach the image just as they do in a normal
+  terminal. Text paste is unchanged.
+- **Mobile-link indicator** — a wifi pill appears in the top bar while one or more
+  phones are connected over the LAN (with a count), and the 📱 button glows green.
+
+### Changed
+
+- Removed the duplicate "Connected" status. The top-bar connection pill is now the
+  single source; the redundant page-header chip is gone.
+
 ## [0.4.1] — 2026-06-24
 
 ### Fixed
@@ -147,6 +163,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.5.0]: https://github.com/kalhintz/Helm/releases/tag/v0.5.0
 [0.4.1]: https://github.com/kalhintz/Helm/releases/tag/v0.4.1
 [0.4.0]: https://github.com/kalhintz/Helm/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kalhintz/Helm/releases/tag/v0.3.0

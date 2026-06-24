@@ -190,6 +190,34 @@ fn pty_kill(state: State<PtyState>, id: u32) {
     state.map.lock().unwrap().remove(&id);
 }
 
+/// Read an image from the OS clipboard (if any), write it to a temp PNG, and
+/// return the path so the terminal/agent can attach it — matching the image-paste
+/// UX agents like opencode and Claude Code expect. Returns None when the clipboard
+/// holds no image, so the caller falls back to a normal text paste.
+#[tauri::command]
+fn paste_clipboard_image(app: AppHandle) -> Option<String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let img = app.clipboard().read_image().ok()?;
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let dir = std::env::temp_dir().join("helm-clip");
+    std::fs::create_dir_all(&dir).ok()?;
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("paste-{}-{}.png", std::process::id(), n));
+    let file = std::fs::File::create(&path).ok()?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().ok()?;
+    writer.write_image_data(img.rgba()).ok()?;
+    writer.finish().ok()?;
+    // forward slashes so agents parse the path cleanly on Windows
+    Some(path.to_string_lossy().replace('\\', "/"))
+}
+
 /// Bridge: dispatch a mobile WS command to the same backend logic the desktop
 /// webview drives through invoke_handler. State is resolved from the AppHandle
 /// (the WS thread doesn't carry Tauri's injected State args). Keep this in sync
@@ -614,6 +642,7 @@ fn main() {
             pty_write,
             pty_resize,
             pty_kill,
+            paste_clipboard_image,
             app_home,
             app_selftest,
             git_branch,
