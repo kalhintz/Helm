@@ -327,6 +327,14 @@ pub fn dispatch_mobile_command(
             let s = app.state::<mobile::MobileState>();
             reply(serde_json::to_value(mobile::mobile_info(s)).unwrap_or(json!(null)));
         }
+        "claude_account_profiles" => reply(json!(claude_account_profiles())),
+        "claude_switch_account" => match stra("profile") {
+            Some(profile) => match claude_switch_account(profile) {
+                Ok(()) => reply(json!(null)),
+                Err(e) => reply_err(e),
+            },
+            None => reply_err("claude_switch_account: bad args".into()),
+        },
         // clipboard plugin commands are no-ops on mobile (browser uses navigator.clipboard)
         other => reply_err(format!("unknown command: {other}")),
     }
@@ -733,6 +741,98 @@ fn opencode_open_models(port: u16) -> bool {
     http_post_json(port, "/tui/open-models", &Value::Null).is_some()
 }
 
+// ===== Feature 2: Claude account auto-switch =====
+//
+// There is NO per-session / per-process Claude account flag — auth lives in the
+// single global ~/.claude/.credentials.json. The only mechanism is to swap that
+// file for one saved under ~/.claude/account-profiles/<name>/credentials.json,
+// then resume with `claude --continue`. The swap is therefore GLOBAL (affects all
+// Claude sessions); the frontend gates it (>=2 profiles, turn boundary, once per
+// session+target). These commands NEVER read, log, or return credential CONTENTS
+// — only profile names, paths, and existence.
+
+/// ~/.claude home (.claude config dir parent). Reused by both account commands.
+fn claude_home() -> Option<std::path::PathBuf> {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".claude"))
+}
+
+/// List account-profile NAMES under ~/.claude/account-profiles/ that contain a
+/// non-empty credentials.json. Returns names only — never opens the file.
+#[tauri::command]
+fn claude_account_profiles() -> Vec<String> {
+    let Some(dir) = claude_home().map(|c| c.join("account-profiles")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let cred = p.join("credentials.json");
+            // existence + non-empty only; the contents are never read.
+            let ok = std::fs::metadata(&cred).map(|m| m.is_file() && m.len() > 0).unwrap_or(false);
+            if ok {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Swap the active ~/.claude/.credentials.json for the named profile's, backing up
+/// the current one first. Atomic (temp file + rename in the same dir). On any
+/// error the active file is left untouched. Never prints file contents.
+#[tauri::command]
+fn claude_switch_account(profile: String) -> Result<(), String> {
+    // reject path traversal / empty
+    if profile.is_empty() || profile.contains(['/', '\\', '.']) {
+        return Err("잘못된 프로필 이름입니다".into());
+    }
+    let home = claude_home().ok_or_else(|| "홈 디렉터리를 찾을 수 없습니다".to_string())?;
+    let src = home.join("account-profiles").join(&profile).join("credentials.json");
+    let active = home.join(".credentials.json");
+
+    // validate source exists & is non-empty BEFORE touching anything.
+    let src_len = std::fs::metadata(&src)
+        .map_err(|_| format!("프로필 '{profile}'의 credentials.json을 찾을 수 없습니다"))?
+        .len();
+    if src_len == 0 {
+        return Err(format!("프로필 '{profile}'의 credentials.json이 비어 있습니다"));
+    }
+
+    // back up the current active credentials first (prevents lockout). Only when
+    // an active file exists — a missing one is fine (fresh install).
+    if active.exists() {
+        let bak = home.join(".credentials.json.helm-bak");
+        std::fs::copy(&active, &bak)
+            .map_err(|e| format!("백업 실패: {e}"))?;
+    }
+
+    // atomic replace: write to a temp file in the same dir, then rename.
+    let tmp = home.join(".credentials.json.helm-tmp");
+    std::fs::copy(&src, &tmp).map_err(|e| format!("프로필 복사 실패: {e}"))?;
+    // size guard — corruption check before committing the rename.
+    let tmp_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    if tmp_len != src_len {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("복사 크기 불일치 — 전환을 중단했습니다".into());
+    }
+    std::fs::rename(&tmp, &active).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("교체 실패: {e}")
+    })?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -816,6 +916,8 @@ fn main() {
             opencode_agents,
             opencode_send,
             opencode_open_models,
+            claude_account_profiles,
+            claude_switch_account,
             mobile::mobile_info
         ])
         .run(tauri::generate_context!())

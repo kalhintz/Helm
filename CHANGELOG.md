@@ -4,6 +4,23 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.8.0] — 2026-06-24
+
+### Added
+
+- **Completed-plan list + one-click execute** — when an agent finishes a plan
+  (Claude plan mode, Codex `update_plan`, opencode plan mode), it appears under a
+  new "계획" tab. Clicking ▶ makes that agent implement the plan directly — no
+  separate start-work or approval step. Plans are content-hash de-duplicated and
+  persist across restarts.
+- **Claude account auto-switch** — when a Claude session's context passes a settable
+  threshold (default 85%) at a turn boundary, Helm swaps to the next configured
+  account profile and resumes with `--continue` (fresh quota). The active credentials
+  are backed up first, so there's no lock-out risk. The feature is gated: it stays
+  disabled until a second account profile exists under `~/.claude/account-profiles/`,
+  with guidance in settings. Account switching is global to Claude, so it only fires
+  when a single Claude session is live.
+
 ## [0.7.0] — 2026-06-24
 
 ### Added
@@ -204,6 +221,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.8.0]: https://github.com/kalhintz/Helm/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kalhintz/Helm/releases/tag/v0.7.0
 [0.6.0]: https://github.com/kalhintz/Helm/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kalhintz/Helm/releases/tag/v0.5.0

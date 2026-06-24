@@ -536,6 +536,13 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
             }
         }
 
+        // Completed-plan detection runs here in the ingest path (not gated behind
+        // hooks_active) so an ExitPlanMode plan is captured even when a hook owns
+        // status/todos.
+        if let Some(plan) = state.pending_plan.take() {
+            emit_plan(&app, pty_id, "claude", &plan, "", "", "");
+        }
+
         // "working" while the transcript is actively growing; otherwise the last
         // turn boundary decides idle vs still-mid-loop.
         let idle = std::fs::metadata(&path)
@@ -588,6 +595,9 @@ struct ClaudeState {
     // granular: live status of the most recent tool_use, by tool_use_id.
     tool_id_status: HashMap<String, String>, // tool_use_id -> running|completed|error
     last_tool_id: String,                    // id of the most recent tool_use
+    // completed-plan detection (Feature 1): ExitPlanMode's plan body.
+    last_plan: String,             // dedup: the last plan we saw
+    pending_plan: Option<String>,  // drained by claude_watch after ingest
 }
 
 impl ClaudeState {
@@ -680,6 +690,16 @@ impl ClaudeState {
                             if let Some(tuid) = item["id"].as_str() {
                                 if !subject.is_empty() {
                                     self.omc_pending.insert(tuid.to_string(), subject);
+                                }
+                            }
+                        } else if name == "ExitPlanMode" {
+                            // Claude finished planning and is yielding for approval —
+                            // capture the plan body for the completed-plan list.
+                            if let Some(plan) = item["input"]["plan"].as_str() {
+                                let plan = plan.trim();
+                                if !plan.is_empty() && plan != self.last_plan {
+                                    self.last_plan = plan.to_string();
+                                    self.pending_plan = Some(plan.to_string());
                                 }
                             }
                         } else if name == "TaskUpdate" {
@@ -840,6 +860,92 @@ fn parse_task_id(text: &str) -> Option<String> {
 
 fn first_in_progress(todos: &[TodoItem]) -> Option<usize> {
     todos.iter().position(|t| t.status == "in_progress")
+}
+
+// ---- completed-plan detection (Feature 1) ----
+//
+// A "completed plan" is emitted as `plan-detected:{pty_id}` the moment an agent
+// finishes planning and yields control. The frontend lists these and can ask the
+// agent to implement the plan directly. The dedup key is a content hash of the
+// plan text, stable across watcher restarts.
+
+/// Stable short hex hash of the plan text (FNV-1a, 64-bit). No new crate.
+fn plan_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// First meaningful line of a plan, stripped of markdown heading/list markers,
+/// truncated for display.
+fn plan_title(text: &str) -> String {
+    for line in text.lines() {
+        let t = line
+            .trim()
+            .trim_start_matches('#')
+            .trim_start_matches(['-', '*', '+'])
+            .trim();
+        // drop a leading "1." / "1)" ordered-list marker
+        let t = t
+            .find([')', '.'])
+            .filter(|i| t[..*i].chars().all(|c| c.is_ascii_digit()) && *i > 0)
+            .map(|i| t[i + 1..].trim())
+            .unwrap_or(t);
+        if !t.is_empty() {
+            return truncate_str(t, 80);
+        }
+    }
+    "계획".to_string()
+}
+
+/// Render a todo list as plan markdown (used for Codex/opencode whose "plan" is a
+/// living todo list, not a discrete document).
+fn todos_to_markdown(title: &str, todos: &[TodoItem]) -> String {
+    let mut md = String::new();
+    if !title.trim().is_empty() {
+        md.push_str(title.trim());
+        md.push_str("\n\n");
+    }
+    for t in todos {
+        let mark = match t.status.as_str() {
+            "completed" => "[x]",
+            "in_progress" => "[~]",
+            _ => "[ ]",
+        };
+        md.push_str(&format!("- {mark} {}\n", t.text));
+    }
+    md.trim_end().to_string()
+}
+
+fn codex_plan_markdown(explanation: &str, todos: &[TodoItem]) -> String {
+    todos_to_markdown(explanation, todos)
+}
+
+/// Emit a completed plan to the frontend. Additive event; never mutates the
+/// agent-progress / conv-msg payloads.
+fn emit_plan(app: &AppHandle, pty_id: u32, agent: &str, plan: &str, model: &str, mode: &str, sid: &str) {
+    let plan = plan.trim();
+    if plan.is_empty() {
+        return;
+    }
+    let ts = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "plan_id": format!("{agent}:{}", plan_hash(plan)),
+        "agent": agent,
+        "title": plan_title(plan),
+        "plan": plan,
+        "model": model,
+        "mode": mode,
+        "sid": sid,
+        "ts": ts,
+    });
+    emit_all(app, &format!("plan-detected:{pty_id}"), payload);
 }
 
 fn summarize_input(input: &Value) -> String {
@@ -1116,6 +1222,10 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
                 }
             }
         }
+        // Completed-plan detection (Feature 1): drain the latest plan snapshot.
+        if let Some(plan) = state.pending_plan.take() {
+            emit_plan(&app, pty_id, "codex", &plan, "", "", "");
+        }
         // Only a safety net for abandoned turns — task_complete is the primary
         // signal that flips status to idle, so this can be generous and not trip
         // during normal multi-second reasoning gaps within a turn.
@@ -1147,6 +1257,9 @@ struct CodexState {
     used_tokens: u64,
     todos: Vec<TodoItem>,
     cur_tool: Option<(String, String)>, // (name, summary) of the last function_call
+    // completed-plan detection (Feature 1): signature of the last emitted plan.
+    last_plan_sig: String,
+    pending_plan: Option<String>,
 }
 impl CodexState {
     fn ingest(&mut self, v: &Value) {
@@ -1184,9 +1297,11 @@ impl CodexState {
                         let name = p["name"].as_str().unwrap_or("call").to_string();
                         // Codex's plan tool mirrors Claude's todo list: plan[{step,status}].
                         if name == "update_plan" {
-                            if let Some(plan) = p["arguments"]
+                            let parsed = p["arguments"]
                                 .as_str()
-                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                .and_then(|s| serde_json::from_str::<Value>(s).ok());
+                            if let Some(plan) = parsed
+                                .as_ref()
                                 .and_then(|av| av["plan"].as_array().cloned())
                             {
                                 self.todos = plan
@@ -1196,6 +1311,19 @@ impl CodexState {
                                         status: s["status"].as_str().unwrap_or("pending").to_string(),
                                     })
                                     .collect();
+                                // Codex has no approval gate — snapshot the plan as
+                                // markdown whenever its content changes and it has
+                                // steps. Re-execution is best-effort (see frontend).
+                                let explanation = parsed
+                                    .as_ref()
+                                    .and_then(|av| av["explanation"].as_str())
+                                    .unwrap_or("");
+                                let md = codex_plan_markdown(explanation, &self.todos);
+                                let sig = self.todos.iter().map(|t| format!("{};", t.text)).collect::<String>();
+                                if !self.todos.is_empty() && sig != self.last_plan_sig {
+                                    self.last_plan_sig = sig;
+                                    self.pending_plan = Some(md);
+                                }
                             }
                         }
                         let summary = p["arguments"]
@@ -1706,6 +1834,8 @@ struct OpencodeState {
     prev_db_status: String,        // edge-trigger for turn-done notifications
     last_turn_done_ms: u64,
     cur_tool: Option<(String, String, String)>, // (name, summary, status) of newest tool part
+    // completed-plan detection (Feature 1): signature of the last emitted plan.
+    last_plan_sig: String,
 }
 impl OpencodeState {
     /// Returns true when the line advanced OUR session (drives working/idle).
@@ -1852,6 +1982,18 @@ impl OpencodeState {
             }) {
                 let todos: Vec<TodoItem> = rows.flatten().collect();
                 self.todos = todos;
+            }
+        }
+
+        // ---- completed-plan detection (Feature 1) ----
+        // opencode's "plan" is its todo list while in a plan-ish mode (e.g. "plan",
+        // "Sisyphus - Planner"). Snapshot it as markdown when content changes.
+        if self.mode.to_lowercase().contains("plan") && !self.todos.is_empty() {
+            let sig = self.todos.iter().map(|t| format!("{};", t.text)).collect::<String>();
+            if sig != self.last_plan_sig {
+                self.last_plan_sig = sig;
+                let md = todos_to_markdown(&self.mode, &self.todos);
+                emit_plan(app, pty_id, "opencode", &md, &self.model, &self.mode, &self.sid);
             }
         }
 

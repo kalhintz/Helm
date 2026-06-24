@@ -16,6 +16,7 @@
         <nav class="tb-nav" id="tb-nav">
           <button class="tb-tab active" data-view="dashboard">세션</button>
           <button class="tb-tab" data-view="todos">작업</button>
+          <button class="tb-tab" data-view="plans">계획</button>
         </nav>
       </div>
 
@@ -238,6 +239,12 @@
       <div class="tv-list" id="tv-list"></div>
     </div>
 
+    <!-- ========================= 계획 (PLANS) VIEW ========================= -->
+    <div id="plans-view" hidden>
+      <div class="tv-head"><span class="tv-head-title">완료된 계획</span> <span class="tv-sub">클릭 한 번으로 바로 실행</span> <span id="pv-count" class="tv-score"></span></div>
+      <div class="pv-list" id="pv-list"></div>
+    </div>
+
     <!-- ========================= SETTINGS MODAL ========================= -->
     <div id="mobile-modal" class="modal-overlay" hidden>
       <div class="modal">
@@ -309,6 +316,23 @@
             <label><input type="checkbox" id="set-oc-awaiting" /> 입력 대기 알림</label>
             <label><input type="checkbox" id="set-oc-conv" /> 대화 기록 표시</label>
             <label><input type="checkbox" id="set-oc-apiswitch" /> API 모델/에이전트 전환</label>
+          </div>
+          <div class="set-group-label">다중 계정 (Claude)</div>
+          <div class="set-ma" id="set-ma-body">
+            <p class="set-ma-note">컨텍스트 사용량이 임계값을 넘으면 다른 Claude 계정 프로필로 전환하고 <code>--continue</code>로 재개합니다. 전환은 전역 자격증명을 교체하므로 <b>모든 Claude 세션에 영향</b>을 줍니다.</p>
+            <div class="set-row">
+              <label for="set-ma-enabled">자동 계정 전환</label>
+              <input type="checkbox" id="set-ma-enabled" />
+            </div>
+            <div class="set-row">
+              <label for="set-ma-threshold">전환 임계값 (컨텍스트 %)</label>
+              <input type="number" id="set-ma-threshold" min="50" max="99" step="1" class="set-num" />
+            </div>
+            <div class="set-ma-order">
+              <div class="set-ma-order-label">계정 프로필 순서</div>
+              <div id="set-ma-profiles" class="set-ma-profiles"></div>
+            </div>
+            <p class="set-ma-guidance" id="set-ma-guidance" hidden></p>
           </div>
         </div>
         <div class="modal-foot">

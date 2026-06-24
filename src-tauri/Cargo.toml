@@ -1,6 +1,6 @@
 [package]
 name = "helm"
-version = "0.7.0"
+version = "0.8.0"
 description = "Helm — native Windows dashboard terminal for AI coding agent CLIs"
 license = "MIT"
 edition = "2021"

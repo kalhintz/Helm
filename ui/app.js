@@ -240,6 +240,12 @@
       showConversation: true, // render the DB-sourced conversation in 대화 view
       apiSwitch: true,        // expose API-backed model/agent switching
     },
+    // Feature 2: Claude account auto-switch. Disabled unless >=2 profiles exist.
+    multiAccount: {
+      enabled: false,
+      thresholdPct: 85,   // switch when a Claude session's context% >= this
+      order: [],          // profile-name rotation order (from claude_account_profiles)
+    },
   };
   const SESSIONS_KEY = "helm.sessions";
   function saveSessionState() {
@@ -255,6 +261,22 @@
   function loadSessionState() {
     try { return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "null"); } catch (_) { return null; }
   }
+
+  /* ---- Feature 1: completed-plan list ----
+     Each agent emits `plan-detected:{pty}` when it finishes a PLAN. We list them
+     (계획 view) and can ask the agent to implement directly. Dedup by plan_id
+     (a content hash) across reconnects / file re-reads. */
+  const PLANS_KEY = "helm.completed-plans";
+  let completedPlans = [];          // newest-first
+  const seenPlanIds = new Set();
+  function loadPlans() {
+    try { completedPlans = JSON.parse(localStorage.getItem(PLANS_KEY) || "[]"); } catch (_) { completedPlans = []; }
+    if (!Array.isArray(completedPlans)) completedPlans = [];
+    completedPlans.forEach((p) => p && p.plan_id && seenPlanIds.add(p.plan_id));
+  }
+  function savePlans() {
+    try { localStorage.setItem(PLANS_KEY, JSON.stringify(completedPlans.slice(0, 50))); } catch (_) {}
+  }
   let settings = loadSettings();
   function loadSettings() {
     let s;
@@ -262,6 +284,8 @@
     const merged = Object.assign({}, DEFAULT_SETTINGS, s);
     merged.show = Object.assign({}, DEFAULT_SETTINGS.show, s.show || {});
     merged.opencode = Object.assign({}, DEFAULT_SETTINGS.opencode, s.opencode || {});
+    merged.multiAccount = Object.assign({}, DEFAULT_SETTINGS.multiAccount, s.multiAccount || {});
+    if (!Array.isArray(merged.multiAccount.order)) merged.multiAccount.order = [];
     return merged;
   }
   function saveSettings() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (_) {} }
@@ -299,7 +323,43 @@
     ocSet("set-oc-awaiting", ococ.notifyAwaiting);
     ocSet("set-oc-conv", ococ.showConversation);
     ocSet("set-oc-apiswitch", ococ.apiSwitch);
+    renderMultiAccountSettings();
     m.hidden = false;
+  }
+  // Build the 다중 계정 settings group from the live profile list. When <2 profiles
+  // exist the whole group is disabled with guidance (the feature is inert).
+  async function renderMultiAccountSettings() {
+    _accountProfilesCache = null;                 // refresh on every open
+    const ma = settings.multiAccount || (settings.multiAccount = { enabled: false, thresholdPct: 85, order: [] });
+    const enabled = $("#set-ma-enabled"), thr = $("#set-ma-threshold");
+    const profilesWrap = $("#set-ma-profiles"), guidance = $("#set-ma-guidance"), body = $("#set-ma-body");
+    if (enabled) enabled.checked = !!ma.enabled;
+    if (thr) thr.value = Math.max(50, Math.min(99, ma.thresholdPct || 85));
+    const profiles = await claudeProfiles();
+    const have2 = profiles.length >= 2;
+    if (body) body.classList.toggle("is-disabled", !have2);
+    [enabled, thr].forEach((c) => { if (c) c.disabled = !have2; });
+    if (guidance) {
+      guidance.hidden = have2;
+      if (!have2) guidance.textContent = "2번째 계정 프로필이 필요합니다 — `claude auth login`으로 추가하세요 (현재 " + profiles.length + "개).";
+    }
+    // sync stored order with the live profile set (keep known order, append new).
+    const order = (ma.order || []).filter((n) => profiles.includes(n));
+    profiles.forEach((n) => { if (!order.includes(n)) order.push(n); });
+    ma.order = order;
+    if (profilesWrap) {
+      profilesWrap.innerHTML = "";
+      if (!profiles.length) {
+        profilesWrap.appendChild(el("div", "set-ma-empty", "프로필 없음 (~/.claude/account-profiles/)"));
+      } else {
+        order.forEach((name, i) => {
+          const row = el("div", "set-ma-prof");
+          row.appendChild(el("span", "set-ma-prof-idx", String(i + 1)));
+          row.appendChild(el("span", "set-ma-prof-name", name));
+          profilesWrap.appendChild(row);
+        });
+      }
+    }
   }
   function closeSettings() { const m = $("#settings-modal"); if (m) m.hidden = true; }
   function wireSettings() {
@@ -326,6 +386,21 @@
     ocBind("set-oc-awaiting", "notifyAwaiting");
     ocBind("set-oc-conv", "showConversation");
     ocBind("set-oc-apiswitch", "apiSwitch");
+    const maEnabled = $("#set-ma-enabled"), maThr = $("#set-ma-threshold");
+    if (maEnabled) maEnabled.addEventListener("change", () => {
+      settings.multiAccount = settings.multiAccount || {};
+      settings.multiAccount.enabled = maEnabled.checked;
+      saveSettings();
+    });
+    if (maThr) maThr.addEventListener("change", () => {
+      settings.multiAccount = settings.multiAccount || {};
+      let v = parseInt(maThr.value, 10);
+      if (isNaN(v)) v = 85;
+      v = Math.max(50, Math.min(99, v));
+      maThr.value = v;
+      settings.multiAccount.thresholdPct = v;
+      saveSettings();
+    });
     const close = $("#set-close"), save = $("#set-save"), reset = $("#set-reset"), modal = $("#settings-modal");
     if (close) close.addEventListener("click", closeSettings);
     if (save) save.addEventListener("click", closeSettings);
@@ -495,7 +570,9 @@
       const unCReset = await listen(`conv-reset:${ptyId}`, () => { session.transcript = []; if (session.convView) renderConv(session); });
       // opencode turn-complete edge (fires even when this tab is active).
       const unTurn = await listen(`agent-turn-done:${ptyId}`, (e) => onTurnDone(session, e.payload));
-      session.unlisten.push(unData, unExit, unProg, unCMsg, unCTool, unCReset, unTurn);
+      // Feature 1: a completed plan was detected for this session.
+      const unPlan = await listen(`plan-detected:${ptyId}`, (e) => onPlanDetected(session, e.payload));
+      session.unlisten.push(unData, unExit, unProg, unCMsg, unCTool, unCReset, unTurn, unPlan);
     } catch (err) {
       session.status = "error";
       if (session.term) session.term.write(`\r\n\x1b[31m[pty 오류: ${err}]\x1b[0m\r\n`);
@@ -927,6 +1004,8 @@
     }
     prog.updatedAt = Date.now();
     if (p.status === "waiting" && (!settings.opencode || session.agent !== "opencode" || settings.opencode.notifyAwaiting !== false)) markAttention(session);
+    // Feature 2: Claude account auto-switch on a context% threshold (gated).
+    maybeAutoSwitchAccount(session, prog);
     App.renderLeft();
     if (store.activeId === session.id) {
       App.renderRight();
@@ -1525,10 +1604,188 @@
       list.appendChild(card);
     });
   }
+  /* ---- Feature 1: completed plans ---- */
+  function onPlanDetected(session, p) {
+    if (!p || !p.plan || !p.plan_id || seenPlanIds.has(p.plan_id)) return;
+    seenPlanIds.add(p.plan_id);
+    completedPlans.unshift(Object.assign({}, p, {
+      ptyId: session.ptyId, sessionId: session.id, sessionTitle: session.title,
+    }));
+    if (completedPlans.length > 50) completedPlans.length = 50;
+    savePlans();
+    pushNotification({ title: "계획 감지됨", body: (session.title || "세션") + " — 새 계획" });
+    markAttention(session);
+    if (store.view === "plans") renderPlansView();
+  }
+  const PLAN_AGENT_BADGE = { claude: "CC", codex: "CX", opencode: "OC" };
+  const PLAN_AGENT_ACCENT = { claude: "orange", codex: "blue", opencode: "purple" };
+  function renderPlansView() {
+    const list = $("#pv-list"), count = $("#pv-count");
+    if (!list) return;
+    list.innerHTML = "";
+    if (count) count.textContent = completedPlans.length ? (completedPlans.length + "개") : "";
+    if (!completedPlans.length) {
+      const empty = el("div", "tv-empty");
+      empty.appendChild(el("div", "tv-empty-ic", "▤"));
+      empty.appendChild(el("div", "tv-empty-title", "완료된 계획이 없습니다"));
+      empty.appendChild(el("div", "tv-empty-sub", "claude · codex · opencode 가 PLAN을 완료하면 여기에 모이고, 한 번의 클릭으로 바로 실행할 수 있습니다."));
+      list.appendChild(empty);
+      return;
+    }
+    completedPlans.forEach((p) => {
+      const accent = PLAN_AGENT_ACCENT[p.agent] || "blue";
+      const card = el("div", "pv-card");
+      const head = el("div", "pv-head");
+      head.appendChild(el("span", "pv-badge is-" + accent, PLAN_AGENT_BADGE[p.agent] || (p.agent || "?").toUpperCase()));
+      head.appendChild(el("span", "pv-title", p.title || "계획"));
+      head.appendChild(el("span", "pv-time", fmtAge(Date.now() - (p.ts || Date.now())) + " 전"));
+      card.appendChild(head);
+
+      const meta = el("div", "pv-meta");
+      meta.appendChild(el("span", "pv-meta-sess", p.sessionTitle || "세션"));
+      const live = !!sessionById(p.sessionId);
+      meta.appendChild(el("span", "pv-meta-state" + (live ? " is-live" : ""), live ? "● 세션 활성" : "○ 세션 종료"));
+      card.appendChild(meta);
+
+      const body = el("div", "pv-body");
+      body.innerHTML = convText(p.plan || "");
+      card.appendChild(body);
+
+      const actions = el("div", "pv-actions");
+      const exec = el("button", "pv-exec", "▶ 바로 실행");
+      exec.title = "이 계획을 에이전트가 즉시 구현하도록 지시합니다";
+      exec.addEventListener("click", () => executePlan(p));
+      const del = el("button", "pv-del", "삭제");
+      del.addEventListener("click", () => {
+        const i = completedPlans.indexOf(p);
+        if (i >= 0) { completedPlans.splice(i, 1); savePlans(); renderPlansView(); }
+      });
+      actions.appendChild(exec);
+      actions.appendChild(del);
+      card.appendChild(actions);
+      list.appendChild(card);
+    });
+  }
+  // The "no separate approval" core: tell the originating agent to implement the
+  // plan directly. Claude is paused on its ExitPlanMode approval menu, where a bare
+  // Enter accepts the highlighted default ("Yes, proceed"); codex/opencode have no
+  // gate, so we send an explicit go-instruction.
+  async function executePlan(p) {
+    const s = sessionById(p.sessionId) || activeSession();
+    if (!s || s.ptyId == null) {
+      pushNotification({ title: "실행 불가", body: "세션이 종료되었습니다" });
+      return;
+    }
+    try {
+      if (s.agent === "claude") {
+        await invoke("pty_write", { id: s.ptyId, data: "\r" });
+      } else if (s.agent === "codex") {
+        await invoke("pty_write", { id: s.ptyId, data: "위 계획을 지금 바로 구현해줘. 다시 계획하지 말고 구현만 진행해.\r" });
+      } else if (s.agent === "opencode") {
+        let ok = false;
+        try {
+          ok = await invoke("opencode_send", {
+            port: s._ocPort || 0,
+            sessionId: s.ocSessionId || p.sid || "",
+            text: "Implement the plan now.",
+            agent: "build", modelId: null, provider: null,
+          });
+        } catch (_) { ok = false; }
+        if (!ok) await invoke("pty_write", { id: s.ptyId, data: "Implement the plan now.\r" });
+      } else {
+        await invoke("pty_write", { id: s.ptyId, data: "위 계획을 지금 바로 구현해줘.\r" });
+      }
+      pushTimeline(s, "계획 바로 실행", s.accent || "blue");
+      selectSession(s.id);
+      gotoSessionsView();
+    } catch (err) {
+      pushNotification({ title: "실행 실패", body: String(err) });
+    }
+  }
+
+  /* ---- Feature 2: Claude account auto-switch ----
+     Switching means swapping the GLOBAL ~/.claude/.credentials.json (no per-session
+     auth exists) then resuming with `claude --continue`. It does NOT shrink the
+     conversation — it gives fresh quota going forward. Gated: enabled in settings,
+     >=2 profiles, Claude agent, fired only at a TURN BOUNDARY (idle/waiting/done),
+     at most once per (session, target-profile). The swap affects ALL Claude
+     sessions, so we also require a single live Claude session. */
+  let _accountProfilesCache = null;          // string[] | null
+  async function claudeProfiles() {
+    if (_accountProfilesCache) return _accountProfilesCache;
+    try { _accountProfilesCache = await invoke("claude_account_profiles"); }
+    catch (_) { _accountProfilesCache = []; }
+    if (!Array.isArray(_accountProfilesCache)) _accountProfilesCache = [];
+    return _accountProfilesCache;
+  }
+  function nextProfile(order, current) {
+    if (!order.length) return null;
+    if (!current) return order[0];
+    const i = order.indexOf(current);
+    return order[(i + 1) % order.length];   // rotate
+  }
+  async function maybeAutoSwitchAccount(session, prog) {
+    if (!session || session.agent !== "claude") return;
+    const ma = settings.multiAccount || {};
+    if (!ma.enabled) return;
+    const ctx = prog && prog.context;
+    if (!ctx || typeof ctx.pct !== "number") return;
+    const threshold = Math.max(50, Math.min(99, ma.thresholdPct || 85));
+    if (ctx.pct < threshold) return;
+    // Only at a turn boundary — never mid-stream.
+    const st = (prog.status || "").toLowerCase();
+    if (st !== "idle" && st !== "waiting" && st !== "done") return;
+    if (session._acctSwitching) return;
+
+    const profiles = await claudeProfiles();
+    if (profiles.length < 2) return;                       // gated: needs >=2
+    const order = (ma.order && ma.order.length ? ma.order : profiles).filter((n) => profiles.includes(n));
+    if (order.length < 2) return;
+    const target = nextProfile(order, session.account || order[0]);
+    if (!target || target === session.account) return;
+    // once per (session, target): don't loop on the same target.
+    session._switchedTargets = session._switchedTargets || {};
+    if (session._switchedTargets[target]) return;
+
+    // safety: the swap is global — require a single live Claude session.
+    const liveClaude = store.sessions.filter((s) => s.agent === "claude" && s.ptyId != null);
+    if (liveClaude.length > 1) {
+      pushNotification({ title: "계정 전환 보류", body: "Claude 세션이 2개 이상 열려 있어 전환이 안전하지 않습니다." });
+      return;
+    }
+    session._switchedTargets[target] = true;
+    await switchClaudeAccount(session, target);
+  }
+  async function switchClaudeAccount(session, target) {
+    if (!session || session._acctSwitching) return;
+    session._acctSwitching = true;
+    const cwd = session.cwd, title = session.title;
+    try {
+      await invoke("claude_switch_account", { profile: target });   // backup + atomic swap
+      pushNotification({ title: "계정 전환: " + target, body: "--continue 로 재개합니다" });
+      pushTimeline(session, "계정 전환: " + target + " (--continue)", "orange");
+      closeSession(session.id);                                     // kill old PTY
+      const ns = await newSession({ agent: "claude", cwd, title, resume: true }); // claude --continue
+      if (ns) {
+        ns.account = target;
+        ns.accountSwitchedAt = Date.now();
+        // carry the once-per-target guard so the new session won't re-switch to it.
+        ns._switchedTargets = Object.assign({}, session._switchedTargets || {});
+        ns._switchedTargets[target] = true;
+      }
+    } catch (err) {
+      pushNotification({ title: "계정 전환 실패", body: String(err) });
+      if (session) session._acctSwitching = false;
+    }
+  }
+
   function switchView(view) {
     const tv = $("#todos-view");
     if (tv) tv.hidden = (view !== "todos");
+    const pv = $("#plans-view");
+    if (pv) pv.hidden = (view !== "plans");
     if (view === "todos") renderTodosView();
+    if (view === "plans") renderPlansView();
   }
   function gotoSessionsView() {
     store.view = "dashboard";
@@ -1978,6 +2235,7 @@
   }
 
   async function main() {
+    loadPlans();
     wireTopbar();
     wireShortcuts();
     wireHeader();
