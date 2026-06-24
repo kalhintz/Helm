@@ -254,9 +254,10 @@
     });
     term.onResize(({ cols, rows }) => { if (session.ptyId != null) invoke("pty_resize", { id: session.ptyId, cols, rows }); });
 
-    // Ctrl+V / Cmd+V / Shift+Insert paste; Ctrl+Shift+C / Cmd+C copy on selection.
-    // Ctrl+C is left alone so it still interrupts the agent. term.paste honors
-    // bracketed-paste, so a multi-line path lands as one chunk in TUIs like claude.
+    // Ctrl+V / Cmd+V / Shift+Insert paste; Ctrl/Cmd+C copy when there's a
+    // selection (Windows-Terminal style) and clears it so the next Ctrl+C
+    // interrupts. With no selection, Ctrl+C falls through to the agent.
+    // term.paste honors bracketed-paste, so a multi-line path lands as one chunk.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       const isV = e.key === "v" || e.key === "V";
@@ -265,8 +266,9 @@
         clipReadText().then((t) => { if (t) term.paste(t); });
         return false;
       }
-      if (((e.ctrlKey && e.shiftKey && isC) || (e.metaKey && isC)) && term.hasSelection()) {
+      if (isC && (e.ctrlKey || e.metaKey) && term.hasSelection()) {
         clipWriteText(term.getSelection());
+        try { term.clearSelection(); } catch (_) {}
         return false;
       }
       return true;
@@ -530,6 +532,11 @@
       pushTimeline(session, agent.label + (resuming ? " 이어서" : " 실행"), agent.accent);
     }
 
+    // Helm launched a known agent itself (no hand-typed command for the sniffer to
+    // catch), so start its log watcher explicitly — otherwise the progress and
+    // conversation panels stay empty.
+    if (agent.launch) detectAgent(session, agentKey);
+
     // resolve git branch for the cwd (real integration)
     invoke("git_branch", { cwd }).then((b) => {
       if (b) { session.branch = b; App.renderLeft(); if (store.activeId === session.id) App.renderRight(); }
@@ -662,19 +669,23 @@
      launch claude/codex/opencode by hand in a plain shell). Updates icon /
      label / accent and starts that agent's progress watcher on the backend. */
   function detectAgent(session, key) {
-    if (!session || !AGENTS[key] || session.agent === key) return;
+    if (!session || !AGENTS[key]) return;
     const a = AGENTS[key];
-    session.agent = key;
-    session.agentLabel = a.label;
-    session.accent = a.accent;
-    if (a.launch) session.launch = a.launch;
-    session.tags = [a.label];
+    if (session.agent !== key) {
+      session.agent = key;
+      session.agentLabel = a.label;
+      session.accent = a.accent;
+      if (a.launch) session.launch = a.launch;
+      session.tags = [a.label];
+      App.renderLeft();
+      if (store.activeId === session.id) { showSession(session.id); App.renderRight(); }
+    }
+    // Start the log watcher even when the agent label was already set (restored or
+    // Helm-launched session) — the old early-return left progress/conversation empty.
     if (session.ptyId != null && session._watch !== key) {
       session._watch = key;
       invoke("start_agent_watch", { id: session.ptyId, agent: key, cwd: session.cwd }).catch(() => {});
     }
-    App.renderLeft();
-    if (store.activeId === session.id) { showSession(session.id); App.renderRight(); }
   }
   function detectAgentFromText(s) {
     const t = (s || "").toLowerCase();
