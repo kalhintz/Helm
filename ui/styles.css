@@ -763,3 +763,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .tb-tab:focus-visible, .cvt:focus-visible, .cx-tab:focus-visible {
   outline: none; box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--ring);
 }
+
+/* composer quick-change controls (model / agent / reasoning) */
+.cx-quick { display: flex; gap: 5px; align-items: center; }
+.cx-quick-btn { font-size: 10.5px; font-weight: 600; color: var(--muted); background: var(--secondary); border: 1px solid var(--border); border-radius: var(--r-pill); padding: 2px 9px; cursor: pointer; transition: color var(--t-fast), border-color var(--t-fast), background var(--t-fast); }
+.cx-quick-btn:hover { color: var(--text); border-color: var(--border-strong); background: var(--panel-hi); }
+.cx-quick-btn:active { transform: translateY(0.5px); }

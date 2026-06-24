@@ -84,6 +84,13 @@
   };
   const FILE_TOOLS = new Set(["Edit", "Write", "Read", "NotebookEdit", "MultiEdit", "edit", "read", "write"]);
   const AGENT_ORDER = ["claude", "codex", "opencode", "pwsh", "cmd", "wsl"];
+  // Quick-change controls above the composer — each click injects the agent's own
+  // slash command so its native picker (model / reasoning effort / agent) opens.
+  const AGENT_CMDS = {
+    claude:   [{ label: "모델", cmd: "/model" }, { label: "에이전트", cmd: "/agents" }],
+    codex:    [{ label: "모델·추론", cmd: "/model" }, { label: "승인", cmd: "/approvals" }],
+    opencode: [{ label: "모델", cmd: "/models" }, { label: "에이전트", cmd: "/agent" }],
+  };
   const statusLabel = (st) => ({ spawning: "시작 중", running: "실행 중", active: "실행 중", attention: "입력 대기", idle: "대기", error: "오류", exited: "종료" }[st] || st);
 
   /* ================================================================
@@ -486,6 +493,7 @@
     if (agentLbl) agentLbl.textContent = session.agentLabel || session.shell || "셸";
     const agentDot = $("#cx-agent-dot");
     if (agentDot) agentDot.style.background = ACCENT_HEX[session.accent] || ACCENT_HEX.green;
+    renderQuickControls(session);
     renderComposerCtx(session);
 
     requestAnimationFrame(() => {
@@ -709,6 +717,25 @@
       fileChips.innerHTML = `<a class="cx-file-chip">${escapeHtml(session.cwd || "")}</a>`;
     }
   }
+  function renderQuickControls(session) {
+    const wrap = $("#cx-quick");
+    if (!wrap) return;
+    wrap.innerHTML = "";
+    const cmds = (session && AGENT_CMDS[session.agent]) || [];
+    cmds.forEach((c) => {
+      const b = el("button", "cx-quick-btn", c.label);
+      b.title = c.cmd + " 보내기";
+      b.addEventListener("click", () => {
+        const s = activeSession();
+        if (s && s.ptyId != null) {
+          invoke("pty_write", { id: s.ptyId, data: c.cmd + "\r" });
+          if (s.term) { try { s.term.focus(); } catch (_) {} }
+        }
+      });
+      wrap.appendChild(b);
+    });
+  }
+
   function renderComposerCtx(s) {
     const wrap = $("#cx-ctx"), nums = $("#cx-ctx-nums"), fill = $("#cx-ctx-fill");
     if (!wrap) return;
