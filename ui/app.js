@@ -712,6 +712,11 @@
       App.renderLeft();
       if (store.activeId === session.id) { showSession(session.id); App.renderRight(); }
     }
+    // Codex's TUI repaints aggressively; a blinking cursor on top reads as the
+    // whole pane flickering, so pin the cursor steady for codex sessions.
+    if (key === "codex" && session.term) {
+      try { session.term.options.cursorBlink = false; } catch (_) {}
+    }
     // Start the log watcher even when the agent label was already set (restored or
     // Helm-launched session) — the old early-return left progress/conversation empty.
     if (session.ptyId != null && session._watch !== key) {

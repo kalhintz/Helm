@@ -330,9 +330,51 @@ fn read_omc_context(cwd: &str) -> Option<Context> {
     Some(Context { used, max, pct })
 }
 
+/// Find the active Claude transcript by scanning ALL project dirs for the newest
+/// *.jsonl whose recorded `cwd` matches this session — robust for vanilla Claude
+/// (no OMC, no hooks), since Claude may write under a git-root slug rather than
+/// the cwd slug. Mirrors how codex rollouts are matched.
+fn newest_claude_transcript(projects: &Path, after: SystemTime, cwd: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(projects) {
+        for slug in rd.flatten() {
+            let sd = slug.path();
+            if !sd.is_dir() {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(&sd) {
+                for e in files.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    let Ok(m) = e.metadata().and_then(|md| md.modified()) else {
+                        continue;
+                    };
+                    if m + Duration::from_secs(86_400) < after {
+                        continue;
+                    }
+                    candidates.push((m, p));
+                }
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in candidates {
+        let matched = first_lines(&p, 15)
+            .iter()
+            .any(|v| v["cwd"].as_str().map_or(false, |c| path_matches(c, cwd)));
+        if matched {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let Some(home) = home_dir() else { return };
-    let dir = home.join(".claude").join("projects").join(slug_for_cwd(&cwd));
+    let projects = home.join(".claude").join("projects");
+    let dir = projects.join(slug_for_cwd(&cwd));
     let evt = format!("agent-progress:{pty_id}");
     let start = SystemTime::now();
 
@@ -341,7 +383,7 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let mut state = ClaudeState::default();
     let mut last_sig = String::new();
     let mut pending: HashMap<String, String> = HashMap::new();
-    let (_fs_watch, fs_rx) = dir_signal(&home.join(".claude").join("projects"));
+    let (_fs_watch, fs_rx) = dir_signal(&projects);
 
     loop {
         // wake the instant claude writes its transcript; 1.2s is just a safety net
@@ -353,6 +395,9 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
         let selected = crate::hook_server::transcript_for(&app, pty_id)
             .map(PathBuf::from)
             .filter(|p| p.exists())
+            // robust vanilla path: newest transcript anywhere whose cwd matches
+            .or_else(|| newest_claude_transcript(&projects, start, &cwd))
+            // last resort: the cwd->slug guess
             .or_else(|| if dir.exists() { newest_jsonl(&dir, start) } else { None });
 
         // (re)select the active transcript; on switch, restart from byte 0.
