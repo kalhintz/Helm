@@ -78,6 +78,10 @@
     wsl:      { label: "WSL",         shell: "wsl",        launch: null,        accent: "blue",   badge: "wsl",      icon: "WL" },
   };
   const agentIcon = (key) => (AGENTS[key] && AGENTS[key].icon) || AGENTS.pwsh.icon;
+  const fmtAge = (ms) => {
+    const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s % 60}s`;
+  };
   const FILE_TOOLS = new Set(["Edit", "Write", "Read", "NotebookEdit", "MultiEdit", "edit", "read", "write"]);
   const AGENT_ORDER = ["claude", "codex", "opencode", "pwsh", "cmd", "wsl"];
   const statusLabel = (st) => ({ spawning: "시작 중", running: "실행 중", active: "실행 중", attention: "입력 대기", idle: "대기", error: "오류", exited: "종료" }[st] || st);
@@ -1041,10 +1045,6 @@
     }
 
     const fmtTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
-    const fmtAge = (ms) => {
-      const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-      return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s % 60}s`;
-    };
     const statusText = (st) => ({ working: "작업 중", waiting: "입력 대기", attention: "입력 대기", idle: "대기 중", done: "완료됨", error: "오류", spawning: "시작 중", running: "실행 중" }[st] || st || "대기 중");
 
     agents.forEach((s) => {
@@ -1060,7 +1060,9 @@
       head.appendChild(el("span", "tv-card-title", s.title || projectName(s.cwd)));
       const right = el("div", "tv-card-right");
       right.appendChild(el("span", "tv-status is-" + st, statusText(st)));
-      right.appendChild(el("span", "tv-elapsed", "⏱ " + fmtAge(Date.now() - (s.startedAt || Date.now()))));
+      const elSpan = el("span", "tv-elapsed", "⏱ " + fmtAge(Date.now() - (s.startedAt || Date.now())));
+      elSpan.dataset.started = s.startedAt || Date.now();
+      right.appendChild(elSpan);
       head.appendChild(right);
       card.appendChild(head);
 
@@ -1070,6 +1072,14 @@
       meta.appendChild(el("span", "tv-meta-folder", "📁 " + projectName(s.cwd)));
       if (s.branch) { meta.appendChild(el("span", "tv-meta-sep", "·")); meta.appendChild(el("span", "tv-meta-branch", s.branch)); }
       card.appendChild(meta);
+
+      const act = (prog.activity || "").trim();
+      if (act) {
+        const actRow = el("div", "tv-activity");
+        actRow.appendChild(el("span", "tv-activity-mark is-" + st, st === "working" ? "▸" : "•"));
+        actRow.appendChild(el("span", "tv-activity-text", act));
+        card.appendChild(actRow);
+      }
 
       const ctxRow = el("div", "tv-ctx");
       ctxRow.appendChild(el("span", "tv-ctx-label", "컨텍스트"));
@@ -1295,6 +1305,11 @@
       const s = activeSession();
       const valSess = $("#rr-val-sess");
       if (s && valSess) valSess.textContent = fmtUptime(s.startedAt);
+      // live elapsed in the tasks board
+      $$(".tv-elapsed[data-started]").forEach((node) => {
+        const st = parseInt(node.dataset.started, 10);
+        if (!isNaN(st)) node.textContent = "⏱ " + fmtAge(Date.now() - st);
+      });
     }, 1000);
   }
 

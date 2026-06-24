@@ -763,11 +763,14 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
                 }
             }
         }
+        // Only a safety net for abandoned turns — task_complete is the primary
+        // signal that flips status to idle, so this can be generous and not trip
+        // during normal multi-second reasoning gaps within a turn.
         let idle = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|m| m.elapsed().ok())
-            .map(|d| d.as_secs() >= 3)
+            .map(|d| d.as_secs() >= 45)
             .unwrap_or(true);
         let prog = state.to_progress(idle);
         let sig = state.signature(&prog);
@@ -792,7 +795,8 @@ impl CodexState {
         match v["type"].as_str().unwrap_or("") {
             "event_msg" => {
                 let pt = v["payload"]["type"].as_str().unwrap_or("");
-                if pt == "assistant_turn_started" || pt == "user_turn_started" {
+                // Codex marks turn boundaries with task_started / task_complete.
+                if pt == "task_started" || pt == "task_complete" {
                     self.last_turn = pt.to_string();
                 } else if pt == "token_count" {
                     let info = &v["payload"]["info"];
@@ -803,6 +807,13 @@ impl CodexState {
                     if let Some(t) = total {
                         if t > 0 {
                             self.used_tokens = t;
+                        }
+                    }
+                } else if pt == "agent_message" {
+                    // Codex narrates what it's doing here — use it as live activity.
+                    if let Some(m) = v["payload"]["message"].as_str() {
+                        if !m.trim().is_empty() {
+                            self.last_text = m.trim().to_string();
                         }
                     }
                 }
@@ -865,7 +876,7 @@ impl CodexState {
         }
     }
     fn to_progress(&self, idle: bool) -> AgentProgress {
-        let status = if self.last_turn == "assistant_turn_started" && !idle {
+        let status = if self.last_turn == "task_started" && !idle {
             "working"
         } else {
             "idle"
