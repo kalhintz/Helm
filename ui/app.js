@@ -1021,24 +1021,43 @@
     withTodos.forEach((s) => { total += s.progress.todos.length; done += s.progress.todos.filter((t) => t.status === "completed").length; });
     if (score) score.textContent = total ? (done + " / " + total) : "";
     if (!withTodos.length) {
-      list.appendChild(el("div", "tv-empty", "활성 에이전트의 작업이 여기에 모입니다 — claude/codex 세션에서 작업하면 표시됩니다."));
+      const empty = el("div", "tv-empty");
+      empty.appendChild(el("div", "tv-empty-ic", "✓"));
+      empty.appendChild(el("div", "tv-empty-title", "아직 작업이 없습니다"));
+      empty.appendChild(el("div", "tv-empty-sub", "claude · codex 세션에서 작업이 시작되면 상태와 함께 여기에 모입니다."));
+      list.appendChild(empty);
       return;
     }
     withTodos.forEach((s) => {
+      const todos = s.progress.todos;
+      const d = todos.filter((t) => t.status === "completed").length;
+      const pct = todos.length ? Math.round((d / todos.length) * 100) : 0;
+
       const card = el("div", "tv-card");
+
       const head = el("div", "tv-card-head");
       head.appendChild(el("span", "cx-tab-ic ag-" + (s.agent || "pwsh"), agentIcon(s.agent)));
       head.appendChild(el("span", "tv-card-title", s.title));
-      const d = s.progress.todos.filter((t) => t.status === "completed").length;
-      head.appendChild(el("span", "tv-card-score", d + "/" + s.progress.todos.length));
+      head.appendChild(el("span", "badge tv-card-badge", d + "/" + todos.length));
       head.addEventListener("click", () => { selectSession(s.id); gotoSessionsView(); });
       card.appendChild(head);
-      s.progress.todos.forEach((t) => {
-        const item = el("div", "rr-todo-item is-" + (t.status || "pending"));
-        item.appendChild(el("span", "rr-todo-check", t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "○"));
-        item.appendChild(el("span", "rr-todo-text", t.text || ""));
-        card.appendChild(item);
+
+      const bar = el("div", "tv-progress");
+      const fill = el("div", "tv-progress-fill" + (pct === 100 ? " is-done" : ""));
+      fill.style.width = pct + "%";
+      bar.appendChild(fill);
+      card.appendChild(bar);
+
+      const items = el("div", "tv-items");
+      todos.forEach((t) => {
+        const st = t.status || "pending";
+        const item = el("div", "tv-item is-" + st);
+        item.appendChild(el("span", "tv-check", st === "completed" ? "✓" : ""));
+        item.appendChild(el("span", "tv-item-text", t.text || ""));
+        if (st === "in_progress") item.appendChild(el("span", "badge badge-amber tv-item-badge", "진행 중"));
+        items.appendChild(item);
       });
+      card.appendChild(items);
       list.appendChild(card);
     });
   }
