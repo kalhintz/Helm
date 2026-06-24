@@ -253,15 +253,21 @@ fn start_agent_watch(app: AppHandle, id: u32, agent: String, cwd: String) {
     // route this cwd's hook events to this pty, and register the agent's hook so
     // it pushes events to us instantly.
     hook_server::register_session(&app, id, &cwd);
-    if agent == "claude" {
-        let port = app
-            .try_state::<hook_server::HookHub>()
-            .map(|h| *h.port.lock().unwrap())
-            .unwrap_or(0);
-        if port != 0 {
+    let port = app
+        .try_state::<hook_server::HookHub>()
+        .map(|h| *h.port.lock().unwrap())
+        .unwrap_or(0);
+    if port != 0 {
+        if agent == "claude" {
             if let Some(fwd) = hook_server::forwarder_path().to_str() {
                 hook_server::register_claude(&cwd, port, fwd);
             }
+        } else if agent == "opencode" {
+            // opencode auto-loads our plugin from its global plugin/ dir; this just
+            // (re)writes it with the current receiver port. (Codex is intentionally
+            // left on the watcher — auto-editing its global hooks.json + trust store
+            // is too risky.)
+            hook_server::register_opencode(port);
         }
     }
     agent_watch::start(app, id, agent, cwd);

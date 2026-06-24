@@ -24,13 +24,19 @@
   // Clipboard via the Tauri clipboard-manager plugin — WebView2's built-in
   // xterm textarea paste is unreliable, so route paste/copy through the plugin.
   async function clipReadText() {
+    // navigator.clipboard reads the real OS clipboard (incl. text copied in other
+    // apps) and works in WebView2 under a keydown gesture; the Tauri plugin is the
+    // fallback. Whichever returns text first wins.
+    try { const s = await navigator.clipboard.readText(); if (s) return s; } catch (_) {}
     try {
       const v = await invoke("plugin:clipboard-manager|read_text", { label: null });
-      if (typeof v === "string") return v;
-      return (v && v.plainText && v.plainText.text) || "";
-    } catch (_) { return ""; }
+      const s = typeof v === "string" ? v : (v && v.plainText && v.plainText.text) || "";
+      if (s) return s;
+    } catch (_) {}
+    return "";
   }
   async function clipWriteText(text) {
+    try { await navigator.clipboard.writeText(text); return; } catch (_) {}
     try { await invoke("plugin:clipboard-manager|write_text", { data: { plainText: { label: null, text } } }); } catch (_) {}
   }
 
