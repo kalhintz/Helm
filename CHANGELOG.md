@@ -4,6 +4,20 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.4.1] — 2026-06-24
+
+### Fixed
+
+- Codex's task list and tools no longer disappear when its native hook becomes
+  active. Those come only from Codex's rollout log (no hook event carries them),
+  so for Codex the log watcher stays the source of truth while the hook just adds
+  an earlier status nudge.
+
+### Docs
+
+- Rewrote the README (English + Korean) with a dedicated mobile-access guide and
+  an updated agent-support matrix.
+
 ## [0.4.0] — 2026-06-24
 
 Codex joins the native-hook pipeline (all three agents now push live state with
@@ -133,6 +147,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.4.1]: https://github.com/kalhintz/Helm/releases/tag/v0.4.1
 [0.4.0]: https://github.com/kalhintz/Helm/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kalhintz/Helm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kalhintz/Helm/releases/tag/v0.2.0

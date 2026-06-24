@@ -987,13 +987,12 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
         let sig = state.signature(&prog);
         if sig != last_sig {
             last_sig = sig;
-            // Once native hooks are live for this pty they own status/activity/todos;
-            // the watcher then contributes only token context (and conversation).
-            if crate::hook_server::hooks_active(&app, pty_id) {
-                emit_all(&app, &evt, serde_json::json!({ "context": prog.context }));
-            } else {
-                emit_all(&app, &evt, &prog);
-            }
+            // Codex's tasks (from `update_plan`) and tools live only in its rollout
+            // log — no Codex hook event carries them — so unlike Claude/opencode the
+            // watcher stays authoritative here even when the hook is live. The
+            // rollout log is read on filesystem-event wake, so this is already
+            // instant; the Codex hook just adds an earlier status/turn nudge.
+            emit_all(&app, &evt, &prog);
         }
     }
 }
