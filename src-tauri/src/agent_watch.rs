@@ -65,6 +65,24 @@ pub struct AgentProgress {
     /// opencode-only: bound session id, so the frontend can drive the switch API.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub sid: String,
+    /// Granular current sub-step (tool + target). Skipped when no live tool —
+    /// keeps existing Claude/Codex payloads byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_tool: Option<CurrentTool>,
+    /// Index into `todos` of the active (in_progress) task, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_todo_index: Option<usize>,
+    /// Step counter, e.g. "4/8" or "4". Empty = omitted.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub step_display: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct CurrentTool {
+    pub name: String,
+    pub target: String,
+    /// running | completed | error
+    pub status: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -107,6 +125,14 @@ pub struct ConvUsage {
     pub max: u64,
 }
 #[derive(Clone, Serialize)]
+pub struct ConvImageBlock {
+    pub mime: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt: Option<String>,
+}
+#[derive(Clone, Serialize)]
 pub struct ConvMessage {
     pub id: String,
     /// user | assistant | system
@@ -116,7 +142,15 @@ pub struct ConvMessage {
     pub thinking: Option<String>,
     pub tool_calls: Vec<ConvToolCall>,
     pub usage: Option<ConvUsage>,
+    /// Inline images (base64 data URIs). Skipped when empty so existing
+    /// conv-msg payloads stay byte-identical.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ConvImageBlock>,
 }
+
+/// Cap on inlined base64 length (~3MB decoded). Larger images are skipped to
+/// avoid bloating one IPC frame.
+const MAX_INLINE_IMG_B64: usize = 4_000_000;
 
 fn truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -216,35 +250,60 @@ fn claude_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut 
             thinking,
             tool_calls,
             usage,
+            images: vec![],
         };
         emit_all(app, &format!("conv-msg:{pty_id}"), &m);
     } else if typ == "user" {
         let content = &msg["content"];
+        let mut images: Vec<ConvImageBlock> = Vec::new();
+        let mut arr_text = String::new();
         if let Some(arr) = content.as_array() {
             let mut had_result = false;
             for item in arr {
-                if item["type"].as_str() == Some("tool_result") {
-                    had_result = true;
-                    let tid = item["tool_use_id"].as_str().unwrap_or("").to_string();
-                    let is_err = item["is_error"].as_bool().unwrap_or(false);
-                    let name = pending.remove(&tid).unwrap_or_default();
-                    let result = truncate_str(&tool_result_text(&item["content"]), 4000);
-                    let tc = ConvToolCall {
-                        id: tid,
-                        name,
-                        summary: String::new(),
-                        status: if is_err { "error".into() } else { "completed".into() },
-                        result: Some(result),
-                    };
-                    emit_all(app, &format!("conv-tool:{pty_id}"), &tc);
+                match item["type"].as_str() {
+                    Some("tool_result") => {
+                        had_result = true;
+                        let tid = item["tool_use_id"].as_str().unwrap_or("").to_string();
+                        let is_err = item["is_error"].as_bool().unwrap_or(false);
+                        let name = pending.remove(&tid).unwrap_or_default();
+                        let result = truncate_str(&tool_result_text(&item["content"]), 4000);
+                        let tc = ConvToolCall {
+                            id: tid,
+                            name,
+                            summary: String::new(),
+                            status: if is_err { "error".into() } else { "completed".into() },
+                            result: Some(result),
+                        };
+                        emit_all(app, &format!("conv-tool:{pty_id}"), &tc);
+                    }
+                    Some("text") => {
+                        if let Some(t) = item["text"].as_str() {
+                            if !arr_text.is_empty() {
+                                arr_text.push('\n');
+                            }
+                            arr_text.push_str(t);
+                        }
+                    }
+                    Some("image") => {
+                        if let Some(img) = claude_image_block(item) {
+                            images.push(img);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            if had_result {
+            // a tool_result turn carries no user-visible body — but an image-only
+            // paste arrives as an array too, so only bail when there's nothing to show.
+            if had_result && arr_text.trim().is_empty() && images.is_empty() {
                 return;
             }
         }
-        let text = content.as_str().unwrap_or("").to_string();
-        if text.trim().is_empty() {
+        let text = if !arr_text.is_empty() {
+            arr_text
+        } else {
+            content.as_str().unwrap_or("").to_string()
+        };
+        if text.trim().is_empty() && images.is_empty() {
             return;
         }
         let m = ConvMessage {
@@ -255,9 +314,29 @@ fn claude_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut 
             thinking: None,
             tool_calls: vec![],
             usage: None,
+            images,
         };
         emit_all(app, &format!("conv-msg:{pty_id}"), &m);
     }
+}
+
+/// Build a `ConvImageBlock` from a Claude `{type:"image", source:{...}}` content
+/// block. Only base64 sources are inlined; oversized images are skipped (None).
+fn claude_image_block(item: &Value) -> Option<ConvImageBlock> {
+    let src = &item["source"];
+    if src["type"].as_str() != Some("base64") {
+        return None;
+    }
+    let mime = src["media_type"].as_str().unwrap_or("image/png").to_string();
+    let data = src["data"].as_str()?;
+    if data.len() > MAX_INLINE_IMG_B64 {
+        return None;
+    }
+    Some(ConvImageBlock {
+        mime: mime.clone(),
+        data_uri: Some(format!("data:{};base64,{}", mime, data)),
+        alt: Some("스크린샷".into()),
+    })
 }
 
 /// Spawn the right watcher for `agent`, bound to `pty_id` + its `cwd`.
@@ -506,6 +585,9 @@ struct ClaudeState {
     // so we hold the subject by tool_use_id until that result arrives.
     omc_pending: HashMap<String, String>,
     omc_tasks: Vec<(String, String, String)>, // (id, text, status)
+    // granular: live status of the most recent tool_use, by tool_use_id.
+    tool_id_status: HashMap<String, String>, // tool_use_id -> running|completed|error
+    last_tool_id: String,                    // id of the most recent tool_use
 }
 
 impl ClaudeState {
@@ -520,6 +602,14 @@ impl ClaudeState {
                         continue;
                     }
                     let tuid = item["tool_use_id"].as_str().unwrap_or("");
+                    // granular: flip the live tool status running -> completed/error.
+                    let st = if item["is_error"].as_bool().unwrap_or(false) { "error" } else { "completed" };
+                    self.tool_id_status.insert(tuid.to_string(), st.into());
+                    if self.tool_id_status.len() > 100 {
+                        // drop everything but the most recent tool's status.
+                        let keep = self.last_tool_id.clone();
+                        self.tool_id_status.retain(|k, _| k == &keep);
+                    }
                     if let Some(subject) = self.omc_pending.get(tuid).cloned() {
                         if let Some(id) = parse_task_id(&tool_result_text(&item["content"])) {
                             self.omc_pending.remove(tuid);
@@ -618,6 +708,11 @@ impl ClaudeState {
                         let summary = summarize_input(&item["input"]);
                         self.last_tool = name.clone();
                         self.last_tool_summary = summary.clone();
+                        // granular: mark this tool live until its tool_result lands.
+                        if let Some(id) = item["id"].as_str() {
+                            self.last_tool_id = id.to_string();
+                            self.tool_id_status.insert(id.to_string(), "running".into());
+                        }
                         self.tools.push(ToolEvent { ts: ts.clone(), name, summary });
                         if self.tools.len() > 100 {
                             let cut = self.tools.len() - 100;
@@ -665,7 +760,7 @@ impl ClaudeState {
 
         let tools = self.tools.iter().rev().take(20).rev().cloned().collect();
         // Prefer the OMC task harness when present, otherwise the TodoWrite list.
-        let todos = if !self.omc_tasks.is_empty() {
+        let todos: Vec<TodoItem> = if !self.omc_tasks.is_empty() {
             self.omc_tasks
                 .iter()
                 .map(|(_, text, status)| TodoItem { text: text.clone(), status: status.clone() })
@@ -674,12 +769,30 @@ impl ClaudeState {
             self.todos.clone()
         };
 
+        let active_todo_index = first_in_progress(&todos);
+        let current_tool = if status == "working" && !self.last_tool.is_empty() {
+            let st = self
+                .tool_id_status
+                .get(&self.last_tool_id)
+                .cloned()
+                .unwrap_or_else(|| "running".into());
+            Some(CurrentTool {
+                name: self.last_tool.clone(),
+                target: self.last_tool_summary.clone(),
+                status: st,
+            })
+        } else {
+            None
+        };
+
         AgentProgress {
             status: status.into(),
             activity,
             todos,
             tools,
             context,
+            current_tool,
+            active_todo_index,
             ..Default::default()
         }
     }
@@ -690,8 +803,13 @@ impl ClaudeState {
         // include the task TEXT, not just status, so a revised plan (same statuses,
         // different steps) re-emits and the rail re-syncs.
         let todo_sig: String = p.todos.iter().map(|t| format!("{}/{};", t.text, t.status)).collect();
+        let cur = p
+            .current_tool
+            .as_ref()
+            .map(|t| format!("{}/{}/{}", t.name, t.target, t.status))
+            .unwrap_or_default();
         format!(
-            "{}|{}|{}/{}|{}|{}|{}|{}",
+            "{}|{}|{}/{}|{}|{}|{}|{}|{}|{}",
             p.status,
             p.activity,
             done,
@@ -699,7 +817,9 @@ impl ClaudeState {
             self.tools.len(),
             last_ts,
             self.used_tokens,
-            todo_sig
+            todo_sig,
+            cur,
+            p.active_todo_index.map(|i| i.to_string()).unwrap_or_default()
         )
     }
 }
@@ -716,6 +836,10 @@ fn parse_task_id(text: &str) -> Option<String> {
     } else {
         Some(digits)
     }
+}
+
+fn first_in_progress(todos: &[TodoItem]) -> Option<usize> {
+    todos.iter().position(|t| t.status == "in_progress")
 }
 
 fn summarize_input(input: &Value) -> String {
@@ -884,6 +1008,7 @@ fn codex_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut H
                 thinking: None,
                 tool_calls: vec![ConvToolCall { id: cid, name, summary, status: "running".into(), result: None }],
                 usage: None,
+                images: vec![],
             };
             emit_all(app, &format!("conv-msg:{pty_id}"), &m);
         }
@@ -911,6 +1036,7 @@ fn codex_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut H
                     thinking: Some(t),
                     tool_calls: vec![],
                     usage: None,
+                    images: vec![],
                 };
                 emit_all(app, &format!("conv-msg:{pty_id}"), &m);
             }
@@ -928,6 +1054,7 @@ fn codex_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut H
                         thinking: None,
                         tool_calls: vec![],
                         usage: None,
+                        images: vec![],
                     };
                     emit_all(app, &format!("conv-msg:{pty_id}"), &m);
                 }
@@ -1019,6 +1146,7 @@ struct CodexState {
     tools: Vec<ToolEvent>,
     used_tokens: u64,
     todos: Vec<TodoItem>,
+    cur_tool: Option<(String, String)>, // (name, summary) of the last function_call
 }
 impl CodexState {
     fn ingest(&mut self, v: &Value) {
@@ -1074,6 +1202,8 @@ impl CodexState {
                             .as_str()
                             .map(|s| s.replace(['\n', '\r'], " ").chars().take(60).collect::<String>())
                             .unwrap_or_default();
+                        // granular: remember the live tool for the right-rail sub-step.
+                        self.cur_tool = Some((name.clone(), summary.clone()));
                         self.push_tool(ts, name, summary);
                     }
                     "function_call_output" | "execution_result" => {
@@ -1125,13 +1255,45 @@ impl CodexState {
             None
         };
         let tools = self.tools.iter().rev().take(20).rev().cloned().collect();
-        AgentProgress { status: status.into(), activity, todos: self.todos.clone(), tools, context, ..Default::default() }
+        let total = self.todos.len();
+        let done = self.todos.iter().filter(|t| t.status == "completed").count();
+        let step_display = if total > 0 { format!("{}/{}", done.min(total), total) } else { String::new() };
+        let active_todo_index = first_in_progress(&self.todos);
+        let current_tool = if status == "working" {
+            self.cur_tool
+                .as_ref()
+                .map(|(n, s)| CurrentTool { name: n.clone(), target: s.clone(), status: "running".into() })
+        } else {
+            None
+        };
+        AgentProgress {
+            status: status.into(),
+            activity,
+            todos: self.todos.clone(),
+            tools,
+            context,
+            current_tool,
+            active_todo_index,
+            step_display,
+            ..Default::default()
+        }
     }
     fn signature(&self, p: &AgentProgress) -> String {
         let last_ts = self.tools.last().map(|t| t.ts.as_str()).unwrap_or("");
         // include task TEXT (not just status) so a revised codex plan re-syncs.
         let todo_sig: String = self.todos.iter().map(|t| format!("{}/{};", t.text, t.status)).collect();
-        format!("{}|{}|{}|{}|{}|{}|{}", p.status, p.activity, self.tools.len(), last_ts, self.used_tokens, self.todos.len(), todo_sig)
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            p.status,
+            p.activity,
+            self.tools.len(),
+            last_ts,
+            self.used_tokens,
+            self.todos.len(),
+            todo_sig,
+            p.step_display,
+            p.active_todo_index.map(|i| i.to_string()).unwrap_or_default()
+        )
     }
 }
 
@@ -1334,6 +1496,41 @@ fn oc_tool_summary(input: &Value) -> String {
     String::new()
 }
 
+/// Best-effort image extraction from an opencode `file`/`image` part. opencode
+/// commonly stores either a `data:` URL or a base64 field. If the shape isn't
+/// clearly an inline image, return None (don't guess).
+fn oc_image_block(p: &Value) -> Option<ConvImageBlock> {
+    let mime = p["mime"]
+        .as_str()
+        .or_else(|| p["media_type"].as_str())
+        .or_else(|| p["mimeType"].as_str())
+        .unwrap_or("");
+    // a data: URL carries its own mime; otherwise require an image/* mime.
+    if let Some(u) = p["url"].as_str().filter(|u| u.starts_with("data:image/")) {
+        if u.len() <= MAX_INLINE_IMG_B64 {
+            let m = mime.is_empty().then(|| "image/png").unwrap_or(mime);
+            return Some(ConvImageBlock {
+                mime: m.to_string(),
+                data_uri: Some(u.to_string()),
+                alt: Some("이미지".into()),
+            });
+        }
+        return None;
+    }
+    if !mime.starts_with("image/") {
+        return None;
+    }
+    let b = p["base64"].as_str().or_else(|| p["data"].as_str())?;
+    if b.len() > MAX_INLINE_IMG_B64 {
+        return None;
+    }
+    Some(ConvImageBlock {
+        mime: mime.to_string(),
+        data_uri: Some(format!("data:{};base64,{}", mime, b)),
+        alt: Some("이미지".into()),
+    })
+}
+
 fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let Some(root) = opencode_root() else { return };
     let evt = format!("agent-progress:{pty_id}");
@@ -1448,6 +1645,7 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
                 thinking: None,
                 tool_calls: vec![],
                 usage: None,
+                images: vec![],
             };
             emit_all(&app, &format!("conv-msg:{pty_id}"), &m);
         }
@@ -1507,6 +1705,7 @@ struct OpencodeState {
     db_status: String,             // working | awaiting_input | queued | idle
     prev_db_status: String,        // edge-trigger for turn-done notifications
     last_turn_done_ms: u64,
+    cur_tool: Option<(String, String, String)>, // (name, summary, status) of newest tool part
 }
 impl OpencodeState {
     /// Returns true when the line advanced OUR session (drives working/idle).
@@ -1656,6 +1855,31 @@ impl OpencodeState {
             }
         }
 
+        // ---- granular: newest tool part (name + summary + live status) ----
+        self.cur_tool = None;
+        if let Ok(row) = conn.query_row(
+            "SELECT p.data FROM part p
+             JOIN message m ON m.id = p.message_id
+             WHERE m.session_id = ?1 AND json_extract(p.data,'$.type')='tool'
+             ORDER BY p.time_created DESC LIMIT 1",
+            [&self.sid],
+            |r| r.get::<_, String>(0),
+        ) {
+            if let Ok(pv) = serde_json::from_str::<Value>(&row) {
+                let st = &pv["state"];
+                let status = match st["status"].as_str().unwrap_or("") {
+                    "completed" => "completed",
+                    "error" => "error",
+                    _ => "running",
+                };
+                self.cur_tool = Some((
+                    pv["tool"].as_str().unwrap_or("tool").to_string(),
+                    oc_tool_summary(&st["input"]),
+                    status.to_string(),
+                ));
+            }
+        }
+
         // ---- status detection ----
         // latest message overall (user or assistant) decides who owes the next move.
         let latest: Option<(String, Value)> = conn
@@ -1753,8 +1977,14 @@ impl OpencodeState {
             let mut text = String::new();
             let mut thinking = String::new();
             let mut tool_calls: Vec<ConvToolCall> = Vec::new();
+            let mut images: Vec<ConvImageBlock> = Vec::new();
             for p in &parts {
                 match p["type"].as_str().unwrap_or("") {
+                    "file" | "image" => {
+                        if let Some(img) = oc_image_block(p) {
+                            images.push(img);
+                        }
+                    }
                     "text" => {
                         if let Some(t) = p["text"].as_str() {
                             if !t.is_empty() {
@@ -1797,7 +2027,7 @@ impl OpencodeState {
                     _ => {}
                 }
             }
-            if text.is_empty() && thinking.is_empty() && tool_calls.is_empty() {
+            if text.is_empty() && thinking.is_empty() && tool_calls.is_empty() && images.is_empty() {
                 continue;
             }
             let usage = if role == "assistant" {
@@ -1821,6 +2051,7 @@ impl OpencodeState {
                 thinking: if thinking.is_empty() { None } else { Some(thinking) },
                 tool_calls,
                 usage,
+                images,
             };
             emit_all(app, &format!("conv-msg:{pty_id}"), &m);
             if finished {
@@ -1872,6 +2103,15 @@ impl OpencodeState {
             self.tools.iter().filter(|t| !t.name.starts_with("mcp__")).collect();
         let start = others.len().saturating_sub(20);
         tools.extend(others[start..].iter().map(|t| (*t).clone()));
+        let active_todo_index = first_in_progress(&self.todos);
+        let current_tool = if status == "working" {
+            self.cur_tool
+                .as_ref()
+                .map(|(n, s, st)| CurrentTool { name: n.clone(), target: s.clone(), status: st.clone() })
+        } else {
+            None
+        };
+        let step_display = if self.step > 0 { format!("{}", self.step) } else { String::new() };
         AgentProgress {
             status: status.into(),
             activity,
@@ -1882,6 +2122,9 @@ impl OpencodeState {
             model: self.model.clone(),
             provider: self.provider.clone(),
             sid: self.sid.clone(),
+            current_tool,
+            active_todo_index,
+            step_display,
         }
     }
 
@@ -1892,8 +2135,13 @@ impl OpencodeState {
             .map(|t| format!("{}/{};", t.text, t.status))
             .collect();
         let ctx = self.context.as_ref().map(|c| c.used).unwrap_or(0);
+        let cur = p
+            .current_tool
+            .as_ref()
+            .map(|t| format!("{}/{}/{}", t.name, t.target, t.status))
+            .unwrap_or_default();
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             p.status,
             p.activity,
             self.tools.len(),
@@ -1904,6 +2152,8 @@ impl OpencodeState {
             todo_sig,
             self.emitted_msgs.len(),
             self.db_status,
+            cur,
+            p.active_todo_index.map(|i| i.to_string()).unwrap_or_default(),
         )
     }
 }

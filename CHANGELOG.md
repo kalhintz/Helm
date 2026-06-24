@@ -4,6 +4,20 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.7.0] — 2026-06-24
+
+### Added
+
+- **Granular progress** — the live activity now shows the current sub-step (the
+  running tool plus its target file/command), highlights which task is in progress,
+  and shows a step counter, in both the right rail and the tasks board — for Claude,
+  Codex, and opencode.
+- **Conversation images** — images in the conversation render as thumbnails; click
+  one to open a lightbox (zoom, arrow-key navigation, Esc / click-out to close) with
+  a copy-image button.
+- **Copy in the conversation** — a copy button on each message (copies its text) and
+  on each code block (copies the code).
+
 ## [0.6.0] — 2026-06-24
 
 Deep opencode integration — Helm now reads opencode's own SQLite store and talks
@@ -190,6 +204,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.7.0]: https://github.com/kalhintz/Helm/releases/tag/v0.7.0
 [0.6.0]: https://github.com/kalhintz/Helm/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kalhintz/Helm/releases/tag/v0.5.0
 [0.4.1]: https://github.com/kalhintz/Helm/releases/tag/v0.4.1

@@ -39,6 +39,27 @@
     try { await navigator.clipboard.writeText(text); return; } catch (_) {}
     try { await invoke("plugin:clipboard-manager|write_text", { data: { plainText: { label: null, text } } }); } catch (_) {}
   }
+  // brief "복사됨" affordance on a copy button.
+  function flashCopied(btn) {
+    const o = btn.textContent;
+    btn.textContent = "✓";
+    btn.classList.add("is-copied");
+    setTimeout(() => { btn.textContent = o; btn.classList.remove("is-copied"); }, 900);
+  }
+  // copy an image via the async Clipboard API (ClipboardItem); returns true on
+  // success. Callers fall back to copying the data-URI text on false.
+  async function clipWriteImage(img) {
+    if (!img || !img.data_uri) return false;
+    try {
+      const res = await fetch(img.data_uri);
+      const blob = await res.blob();
+      if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
 
   const $  = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
@@ -508,8 +529,13 @@
     if (tc.result) {
       const d = el("details", "conv-tool-result");
       d.appendChild(el("summary", null, "결과"));
+      const wrap = el("div", "conv-code-wrap");
+      const cBtn = el("button", "conv-code-copy", "⧉");
+      cBtn.title = "코드 복사";
+      cBtn.addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); clipWriteText(tc.result); flashCopied(cBtn); });
       const pre = el("pre", "conv-code"); pre.textContent = tc.result;
-      d.appendChild(pre);
+      wrap.appendChild(cBtn); wrap.appendChild(pre);
+      d.appendChild(wrap);
       row.appendChild(d);
     }
     return row;
@@ -520,6 +546,10 @@
     const head = el("div", "conv-head");
     head.appendChild(el("span", "conv-role-badge", (m.role || "").toUpperCase()));
     if (m.usage && m.usage.max) head.appendChild(el("span", "conv-usage", fmtTokens(m.usage.used) + " / " + fmtTokens(m.usage.max)));
+    const copyBtn = el("button", "conv-copy-btn", "⧉");
+    copyBtn.title = "메시지 복사";
+    copyBtn.addEventListener("click", (e) => { e.stopPropagation(); clipWriteText(m.text || ""); flashCopied(copyBtn); });
+    head.appendChild(copyBtn);
     art.appendChild(head);
     if (m.thinking) {
       const d = el("details", "conv-thinking");
@@ -529,12 +559,75 @@
       art.appendChild(d);
     }
     if (m.text) { const t = el("div", "conv-text"); t.innerHTML = convText(m.text); art.appendChild(t); }
+    if (m.images && m.images.length) {
+      const gal = el("div", "conv-img-gallery");
+      m.images.forEach((img, idx) => {
+        if (img.data_uri) {
+          const t = el("img", "conv-img-thumb");
+          t.src = img.data_uri; t.alt = img.alt || "image"; t.loading = "lazy";
+          t.addEventListener("click", () => openImageLightbox(m.images, idx));
+          gal.appendChild(t);
+        } else {
+          gal.appendChild(el("span", "conv-img-missing", img.alt || "이미지"));
+        }
+      });
+      art.appendChild(gal);
+    }
     if (m.tool_calls && m.tool_calls.length) {
       const tools = el("div", "conv-tools");
       m.tool_calls.forEach((tc) => tools.appendChild(buildConvTool(tc)));
       art.appendChild(tools);
     }
     return art;
+  }
+  let _lbKey = null;
+  function openImageLightbox(images, idx) {
+    const imgs = (images || []).filter((x) => x.data_uri);
+    if (!imgs.length) return;
+    let i = Math.max(0, Math.min(idx, imgs.length - 1));
+    let lb = $("#image-lightbox");
+    if (!lb) {
+      lb = el("div", "modal-overlay image-lightbox"); lb.id = "image-lightbox";
+      lb.addEventListener("click", (e) => { if (e.target === lb) closeImageLightbox(); });
+      document.body.appendChild(lb);
+    }
+    function paint() {
+      const cur = imgs[i];
+      lb.innerHTML = "";
+      const box = el("div", "lb-box");
+      const head = el("div", "lb-head");
+      head.appendChild(el("span", "lb-count", (i + 1) + " / " + imgs.length));
+      const btns = el("div", "lb-btns");
+      const copy = el("button", "lb-btn", "복사");
+      copy.addEventListener("click", async () => {
+        const ok = await clipWriteImage(cur);
+        if (!ok) clipWriteText(cur.data_uri);
+        copy.textContent = ok ? "복사됨" : "URI 복사됨";
+        setTimeout(() => { copy.textContent = "복사"; }, 1000);
+      });
+      btns.appendChild(copy);
+      if (imgs.length > 1) {
+        const prev = el("button", "lb-btn", "‹"); prev.addEventListener("click", () => { i = (i - 1 + imgs.length) % imgs.length; paint(); });
+        const next = el("button", "lb-btn", "›"); next.addEventListener("click", () => { i = (i + 1) % imgs.length; paint(); });
+        btns.appendChild(prev); btns.appendChild(next);
+      }
+      const x = el("button", "modal-x", "✕"); x.addEventListener("click", closeImageLightbox);
+      btns.appendChild(x); head.appendChild(btns); box.appendChild(head);
+      const body = el("div", "lb-body");
+      const im = el("img", "lb-img"); im.src = cur.data_uri; im.alt = cur.alt || "image";
+      body.appendChild(im); box.appendChild(body); lb.appendChild(box);
+    }
+    _lbKey = (e) => {
+      if (e.key === "Escape") closeImageLightbox();
+      else if (e.key === "ArrowLeft" && imgs.length > 1) { i = (i - 1 + imgs.length) % imgs.length; paint(); }
+      else if (e.key === "ArrowRight" && imgs.length > 1) { i = (i + 1) % imgs.length; paint(); }
+    };
+    document.addEventListener("keydown", _lbKey);
+    lb.hidden = false; paint();
+  }
+  function closeImageLightbox() {
+    const lb = $("#image-lightbox"); if (lb) lb.hidden = true;
+    if (_lbKey) { document.removeEventListener("keydown", _lbKey); _lbKey = null; }
   }
   function renderConv(session) {
     const slot = session.convSlot;
@@ -780,6 +873,17 @@
     if (n >= 1000) return (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k";
     return String(n);
   }
+  const TOOL_ICONS = {
+    Edit: "✎", MultiEdit: "✎", Write: "✚", Read: "▤", Bash: "❯", Grep: "⌕",
+    Glob: "⌕", WebFetch: "🌐", webfetch: "🌐", Task: "⛓", TodoWrite: "☑",
+    edit: "✎", read: "▤", write: "✚", bash: "❯", grep: "⌕", list: "▤",
+    patch: "✎", update_plan: "☑",
+  };
+  function toolIcon(n) {
+    if (TOOL_ICONS[n]) return TOOL_ICONS[n];
+    if (typeof n === "string" && n.startsWith("mcp__")) return "⧉";
+    return "◆";
+  }
   function toolText(t) {
     const name = t.name || "tool";
     return t.summary ? `${name} · ${t.summary}` : name;
@@ -791,6 +895,11 @@
     if (p.activity != null) prog.activity = p.activity;
     if (Array.isArray(p.todos)) prog.todos = p.todos;
     if (p.context) prog.context = p.context;
+    // granular sub-step (additive; skip-if-empty on the backend means these
+    // arrive only when present — clear them otherwise so a stale chip drops).
+    prog.current_tool = p.current_tool || null;
+    prog.active_todo_index = (typeof p.active_todo_index === "number") ? p.active_todo_index : null;
+    prog.step_display = p.step_display || "";
     // opencode mode/model/provider/sid (DB-sourced) — drives the chip + switch API
     if (p.mode != null && p.mode !== "") session.currentMode = p.mode;
     if (p.model != null && p.model !== "") session.currentModel = p.model;
@@ -1159,6 +1268,29 @@
     const act = $("#rr-prog-activity");
     if (act) act.textContent = (prog && prog.activity) || (s ? "활동 대기 중" : "세션 없음");
 
+    // granular current sub-step (tool + target + step counter)
+    const sub = $("#rr-prog-sub");
+    if (sub) {
+      const ct = prog && prog.current_tool;
+      const step = prog && prog.step_display;
+      if (ct || step) {
+        sub.hidden = false;
+        sub.innerHTML = "";
+        if (ct) {
+          const stMark = ct.status === "completed" ? "✓" : ct.status === "error" ? "✕" : "▸";
+          const chip = el("span", "rr-substep-tool is-" + (ct.status || "running"));
+          chip.appendChild(el("span", "rr-substep-ic", toolIcon(ct.name)));
+          chip.appendChild(el("span", "rr-substep-name", ct.name));
+          if (ct.target) chip.appendChild(el("span", "rr-substep-tgt", ct.target));
+          chip.appendChild(el("span", "rr-substep-st", stMark));
+          sub.appendChild(chip);
+        }
+        if (step) sub.appendChild(el("span", "rr-substep-step", "단계 " + step));
+      } else {
+        sub.hidden = true;
+      }
+    }
+
     // context meter (real token usage when the agent reports it)
     const ctxWrap = $("#rr-ctx-wrap"), ctxBar = $("#rr-ctx-bar"), ctxNums = $("#rr-ctx-nums");
     if (ctxWrap) {
@@ -1184,8 +1316,10 @@
       } else {
         const done = todos.filter((t) => t.status === "completed").length;
         if (todoScore) todoScore.textContent = done + "/" + todos.length;
-        todos.forEach((t) => {
+        const activeIdx = (prog && typeof prog.active_todo_index === "number") ? prog.active_todo_index : -1;
+        todos.forEach((t, i) => {
           const item = el("div", "rr-todo-item is-" + (t.status || "pending"));
+          if (i === activeIdx) item.classList.add("is-active");
           const mark = t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "○";
           item.appendChild(el("span", "rr-todo-check", mark));
           item.appendChild(el("span", "rr-todo-text", t.text || ""));
@@ -1364,6 +1498,18 @@
         actRow.appendChild(el("span", "tv-activity-mark is-" + st, st === "working" ? "▸" : "•"));
         actRow.appendChild(el("span", "tv-activity-text", act));
         card.appendChild(actRow);
+      }
+
+      // granular sub-step: current tool + step counter
+      if (prog.current_tool || prog.step_display) {
+        const subRow = el("div", "tv-substep");
+        if (prog.current_tool) {
+          subRow.appendChild(el("span", "tv-substep-ic", toolIcon(prog.current_tool.name)));
+          subRow.appendChild(el("span", "tv-substep-name", prog.current_tool.name));
+          if (prog.current_tool.target) subRow.appendChild(el("span", "tv-substep-tgt", prog.current_tool.target));
+        }
+        if (prog.step_display) subRow.appendChild(el("span", "tv-substep-step", "단계 " + prog.step_display));
+        card.appendChild(subRow);
       }
 
       const ctxRow = el("div", "tv-ctx");
