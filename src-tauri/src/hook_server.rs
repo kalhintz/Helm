@@ -207,9 +207,7 @@ fn read_claude_tasks(sid: &str) -> Option<Vec<Value>> {
     if sid.is_empty() {
         return None;
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
+    let home = crate::home_var()?;
     let dir = std::path::Path::new(&home).join(".claude").join("tasks").join(sid);
     let mut items: Vec<(u64, Value)> = Vec::new();
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
@@ -242,9 +240,7 @@ fn read_claude_tasks(sid: &str) -> Option<Vec<Value>> {
 }
 
 fn helm_dir() -> std::path::PathBuf {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
+    let home = crate::home_var().unwrap_or_default();
     std::path::Path::new(&home).join(".helm")
 }
 
@@ -279,9 +275,7 @@ pub fn write_forwarder(port: u16) {
 }
 
 fn opencode_plugin_dir() -> std::path::PathBuf {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
+    let home = crate::home_var().unwrap_or_default();
     std::path::Path::new(&home)
         .join(".config")
         .join("opencode")
@@ -338,9 +332,7 @@ fn summarize(input: &Value) -> String {
 pub fn register_claude(cwd: &str, _port: u16, forwarder: &str) {
     let settings_dir = std::path::Path::new(cwd).join(".claude");
     // NEVER touch the user's global ~/.claude — only genuinely project-local dirs.
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
+    let home = crate::home_var().unwrap_or_default();
     let global = std::path::Path::new(&home).join(".claude");
     if norm(&settings_dir.to_string_lossy()) == norm(&global.to_string_lossy()) {
         return;
@@ -409,9 +401,7 @@ fn group_mentions(group: &Value, forwarder: &str) -> bool {
 /// back, so `"state"` and every OMX group survive. We never write trust hashes;
 /// Codex's one-time interactive TUI prompt approves the new hook.
 pub fn register_codex(_port: u16, forwarder: &str) {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
+    let home = crate::home_var().unwrap_or_default();
     if home.is_empty() {
         return;
     }

@@ -366,10 +366,7 @@ fn slug_for_cwd(cwd: &str) -> String {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()
-        .map(PathBuf::from)
+    crate::home_var().map(PathBuf::from)
 }
 
 /// Newest *.jsonl in `dir` whose mtime is at/after the watch start (so we bind to
@@ -1659,6 +1656,29 @@ fn oc_image_block(p: &Value) -> Option<ConvImageBlock> {
     })
 }
 
+/// Cheap change signature for the opencode SQLite store: folds the size+mtime of
+/// the DB and its WAL (where live writes land). The watcher only re-queries the
+/// 3.6 GB DB when this changes, so an idle session stops thrashing SQLite.
+fn oc_db_sig(db_path: &Option<PathBuf>) -> u128 {
+    let Some(p) = db_path else { return 0 };
+    let mut sig: u128 = 0;
+    for f in [p.clone(), p.with_extension("db-wal")] {
+        if let Ok(m) = std::fs::metadata(&f) {
+            let mt = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            sig = sig
+                .wrapping_mul(1_099_511_628_211)
+                .wrapping_add(m.len() as u128)
+                .wrapping_add(mt);
+        }
+    }
+    sig
+}
+
 fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let Some(root) = opencode_root() else { return };
     let evt = format!("agent-progress:{pty_id}");
@@ -1675,6 +1695,9 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let mut idle_polls: u32 = 0;
     let mut last_activity = String::new();
     let mut conv_seq: u64 = 0;
+    let db_path = opencode_db_path();
+    let mut last_db_sig: u128 = 0;
+    let mut last_query = std::time::Instant::now();
     let (_fs_watch, fs_rx) = dir_signal(&root);
 
     loop {
@@ -1756,8 +1779,16 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
         // The DB is authoritative: mode/model/context/todos/status + conversation.
         // Conversation is always emitted from the DB; the frontend's
         // `showConversation` setting decides whether to render it.
+        // Only hit the 3.6 GB DB when something actually changed: the log tail saw
+        // activity, the DB/WAL size+mtime moved, or a 3 s safety cadence elapsed
+        // (catches WAL writes the dir-watch may miss). Kills idle query thrash.
         if let Some(conn) = db.as_ref() {
-            state.db_sync(&app, conn, pty_id, true);
+            let sig = oc_db_sig(&db_path);
+            if saw || sig != last_db_sig || last_query.elapsed() >= Duration::from_secs(3) {
+                last_db_sig = sig;
+                last_query = std::time::Instant::now();
+                state.db_sync(&app, conn, pty_id, true);
+            }
         }
 
         // Fallback conversation: only when the DB is absent — surface logfmt

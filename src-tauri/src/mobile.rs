@@ -96,6 +96,11 @@ impl Default for MobileState {
 pub fn emit_all<S: Serialize + Clone>(app: &AppHandle, event: &str, payload: S) {
     let _ = app.emit(event, payload.clone());
     if let Some(bus) = app.try_state::<Bus>() {
+        // No phone connected: skip the serialize + frame build entirely. This is
+        // the common case and runs on the PTY firehose + image-heavy conv-msg.
+        if bus.active.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
         // Build {event, payload} once. serde_json::to_value can't fail for our
         // payloads (all derive Serialize); on the impossible error we just skip WS.
         if let Ok(pv) = serde_json::to_value(&payload) {

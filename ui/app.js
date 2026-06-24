@@ -64,6 +64,8 @@
   const $  = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
   const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+  // set an element's text by id (no '#'); no-op if the node is absent.
+  const setTxt = (id, v) => { const e = $("#" + id); if (e) e.textContent = String(v); };
   const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   function b64ToBytes(b64) {
@@ -257,6 +259,14 @@
       const activeIndex = store.sessions.findIndex((s) => s.id === store.activeId);
       localStorage.setItem(SESSIONS_KEY, JSON.stringify({ sessions, activeIndex }));
     } catch (_) {}
+  }
+  // Debounced persist (~500ms): fired from every site that mutates a persisted
+  // field, replacing the old 2s blind setInterval. beforeunload still saves
+  // synchronously so the last change is never lost.
+  let _saveTimer = null;
+  function scheduleSave() {
+    if (_saveTimer) clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(() => { _saveTimer = null; saveSessionState(); }, 500);
   }
   function loadSessionState() {
     try { return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "null"); } catch (_) { return null; }
@@ -511,6 +521,7 @@
               const tt = $("#cx-title-text"); if (tt) tt.textContent = t;
               const ph = $("#ph-title"); if (ph) ph.textContent = t;
             }
+            scheduleSave();
           }
           const dk = detectAgentFromText(t);
           if (dk) detectAgent(session, dk);
@@ -725,11 +736,28 @@
   function onConvMsg(session, m) {
     if (!m) return;
     const idx = session.transcript.findIndex((x) => x.id === m.id);
-    if (idx >= 0) session.transcript[idx] = m; else session.transcript.push(m);
-    if (session.transcript.length > 300) session.transcript.shift();
+    const isNew = idx < 0;
+    if (isNew) session.transcript.push(m); else session.transcript[idx] = m;
+    let shifted = false;
+    if (session.transcript.length > 300) { session.transcript.shift(); shifted = true; }
     session.msgCount = session.transcript.length;
     if (store.activeId === session.id) { const n = $("#cx-msg-n"); if (n) n.textContent = String(session.msgCount); }
-    if (session.convSlot && session.convView) renderConv(session);
+    if (!(session.convSlot && session.convView)) return;
+    // Diff the single changed message instead of tearing down the whole transcript
+    // (conv-msg fires 10+/s under load). Fall back to a full render whenever index
+    // math could drift — cap shift, first message, hidden view, or node mismatch.
+    const slot = session.convSlot;
+    const hidden = session.agent === "opencode" && settings.opencode && settings.opencode.showConversation === false;
+    const nodes = slot.querySelectorAll(".conv-msg");
+    if (hidden || shifted || session.transcript.length <= 1 || nodes.length !== session.transcript.length - (isNew ? 1 : 0)) {
+      renderConv(session);
+      return;
+    }
+    const atBottom = slot.scrollHeight - slot.scrollTop - slot.clientHeight < 80;
+    if (isNew) slot.appendChild(buildConvMsg(m));
+    else if (nodes[idx]) slot.replaceChild(buildConvMsg(m), nodes[idx]);
+    else { renderConv(session); return; }
+    if (atBottom) slot.scrollTop = slot.scrollHeight;
   }
   function onConvTool(session, tc) {
     if (!tc) return;
@@ -870,6 +898,7 @@
     App.renderHeaderChips();
 
     if (store.activeId == null) selectSession(id);
+    scheduleSave();
     return session;
   }
 
@@ -882,6 +911,7 @@
     showSession(id);
     App.renderRight();
     App.renderHeaderChips();
+    scheduleSave();
   }
 
   function closeSession(id) {
@@ -905,15 +935,16 @@
     showSession(store.activeId);
     App.renderRight();
     App.renderHeaderChips();
+    scheduleSave();
   }
 
   function renameSession(id, title) {
     const s = sessionById(id);
-    if (s) { s.title = title; s.titleLocked = true; App.renderLeft(); showSession(store.activeId); App.renderHeaderChips(); }
+    if (s) { s.title = title; s.titleLocked = true; App.renderLeft(); showSession(store.activeId); App.renderHeaderChips(); scheduleSave(); }
   }
   function togglePin(id) {
     const s = sessionById(id);
-    if (s) { s.pinned = !s.pinned; App.renderLeft(); showSession(store.activeId); }
+    if (s) { s.pinned = !s.pinned; App.renderLeft(); showSession(store.activeId); scheduleSave(); }
   }
 
   function pushTimeline(session, text, color, dur) {
@@ -965,6 +996,36 @@
     const name = t.name || "tool";
     return t.summary ? `${name} · ${t.summary}` : name;
   }
+
+  /* Coalesce the render fan-out from a fast agent-progress stream into one
+     requestAnimationFrame flush. Dirty flags accumulate between paints; the flush
+     renders each dirtied surface once with current store state — same final DOM
+     as rendering synchronously per event, but N events/frame collapse to one. */
+  const _renderDirty = { left: false, right: false, todos: false };
+  let _renderRaf = 0;
+  function flushRender() {
+    _renderRaf = 0;
+    const left = _renderDirty.left, right = _renderDirty.right, todos = _renderDirty.todos;
+    _renderDirty.left = _renderDirty.right = _renderDirty.todos = false;
+    if (left) App.renderLeft();
+    if (right) {
+      const s = activeSession();
+      if (s) {
+        App.renderRight();
+        renderComposerCtx(s);
+        renderFileChips(s);
+        if (s.agent === "opencode") renderQuickControls(s).catch(() => {});
+      }
+    }
+    if (todos && store.view === "todos") renderTodosView();
+  }
+  function scheduleProgressRender(activeForSession) {
+    _renderDirty.left = true;
+    if (activeForSession) _renderDirty.right = true;
+    _renderDirty.todos = true;
+    if (!_renderRaf) _renderRaf = requestAnimationFrame(flushRender);
+  }
+
   function applyProgress(session, p) {
     if (!session || !p) return;
     const prog = session.progress || (session.progress = { status: "idle", activity: "", todos: [], context: null });
@@ -1006,14 +1067,7 @@
     if (p.status === "waiting" && (!settings.opencode || session.agent !== "opencode" || settings.opencode.notifyAwaiting !== false)) markAttention(session);
     // Feature 2: Claude account auto-switch on a context% threshold (gated).
     maybeAutoSwitchAccount(session, prog);
-    App.renderLeft();
-    if (store.activeId === session.id) {
-      App.renderRight();
-      renderComposerCtx(session);
-      renderFileChips(session);
-      if (session.agent === "opencode") renderQuickControls(session).catch(() => {});
-    }
-    if (store.view === "todos") renderTodosView();
+    scheduleProgressRender(store.activeId === session.id);
   }
 
   /* Re-identify a session by what is actually running inside it (the user may
@@ -1030,6 +1084,7 @@
       session.tags = [a.label];
       App.renderLeft();
       if (store.activeId === session.id) { showSession(session.id); App.renderRight(); }
+      scheduleSave();
     }
     // Codex's TUI repaints aggressively; a blinking cursor on top reads as the
     // whole pane flickering, so pin the cursor steady for codex sessions.
@@ -1064,6 +1119,7 @@
     pushTimeline(session, a.label + " (에이전트 종료)", "blue");
     App.renderLeft();
     if (store.activeId === session.id) { showSession(session.id); App.renderRight(); }
+    scheduleSave();
   }
   function detectAgentFromText(s) {
     const t = (s || "").toLowerCase();
@@ -1167,6 +1223,9 @@
      ================================================================ */
   let _activeOnly = false;
   let _seg = "project";
+  // Live uptime nodes, rebuilt each renderLeft so the per-second ticker updates
+  // them directly instead of re-running querySelectorAll(".lr-uptime") every tick.
+  let _uptimeNodes = [];
 
   function buildRow(s) {
     const row = el("div", "lr-row" + (s.id === store.activeId ? " selected" : "") + (s.status === "attention" ? " attention" : "") + (s.progress && s.progress.status === "working" ? " agent-working" : ""));
@@ -1189,6 +1248,7 @@
     top.appendChild(title);
     const uptime = el("span", "lr-uptime", fmtUptime(s.startedAt));
     uptime.dataset.started = String(s.startedAt);
+    _uptimeNodes.push({ node: uptime, started: s.startedAt });
     top.appendChild(uptime);
     main.appendChild(top);
 
@@ -1245,6 +1305,7 @@
       ? store.sessions.filter((s) => s.status === "running" || s.status === "active")
       : store.sessions;
     list.innerHTML = "";
+    _uptimeNodes = [];
     if (!visible.length) {
       list.appendChild(el("div", "lr-empty", "세션 없음"));
       return;
@@ -1269,30 +1330,22 @@
      ================================================================ */
   function barColorClass(p) { return p >= 80 ? "rr-bar-red" : p >= 50 ? "rr-bar-orange" : "rr-bar-green"; }
   function valColorClass(p) { return p >= 80 ? "rr-red" : p >= 50 ? "rr-orange" : "rr-green"; }
+  // A percent bar + its value label (CPU/MEM share this exact shape).
+  function renderPctBar(barId, valId, pct) {
+    const bar = $("#" + barId), val = $("#" + valId);
+    if (bar) {
+      bar.style.width = pct + "%";
+      bar.className = "rr-bar " + barColorClass(pct);
+      val.textContent = pct.toFixed(0) + "%";
+      val.className = "rr-usage-val " + valColorClass(pct);
+    }
+  }
 
   function renderSystemCard(stats) {
     const cpu = Math.min(100, Math.max(0, stats.cpu || 0));
     const mem = Math.min(100, Math.max(0, stats.mem || 0));
-    const set = (barId, valId, pct, label) => {
-      const bar = $("#" + barId), val = $("#" + valId);
-      if (!bar) return;
-      bar.style.width = pct + "%";
-      val.textContent = label != null ? label : pct.toFixed(0) + "%";
-    };
-    const barCpu = $("#rr-bar-cpu"), valCpu = $("#rr-val-cpu");
-    if (barCpu) {
-      barCpu.style.width = cpu + "%";
-      barCpu.className = "rr-bar " + barColorClass(cpu);
-      valCpu.textContent = cpu.toFixed(0) + "%";
-      valCpu.className = "rr-usage-val " + valColorClass(cpu);
-    }
-    const barMem = $("#rr-bar-mem"), valMem = $("#rr-val-mem");
-    if (barMem) {
-      barMem.style.width = mem + "%";
-      barMem.className = "rr-bar " + barColorClass(mem);
-      valMem.textContent = mem.toFixed(0) + "%";
-      valMem.className = "rr-usage-val " + valColorClass(mem);
-    }
+    renderPctBar("rr-bar-cpu", "rr-val-cpu", cpu);
+    renderPctBar("rr-bar-mem", "rr-val-mem", mem);
     // session uptime (active session), capped to 4h for the bar
     const s = activeSession();
     const barSess = $("#rr-bar-sess"), valSess = $("#rr-val-sess");
@@ -1311,8 +1364,7 @@
   function renderRight() {
     const s = activeSession();
 
-    // active-session info card
-    const setTxt = (id, v) => { const e = $("#" + id); if (e) e.textContent = v; };
+    // active-session info card (setTxt is the global id->text helper)
     if (s) {
       setTxt("rr-sess-agent", s.agentLabel || s.shell || "셸");
       const stEl = $("#rr-sess-status");
@@ -1478,9 +1530,8 @@
 
   function renderHeaderChips() {
     const sessions = store.sessions;
-    const set = (sel, v) => { const e = $(sel); if (e) e.textContent = String(v); };
-    set("#chip-active-n", runningCount());
-    set("#chip-loaded-n", sessions.length);
+    setTxt("chip-active-n", runningCount());
+    setTxt("chip-loaded-n", sessions.length);
 
     const counts = {};
     for (const s of sessions) { const k = projectName(s.cwd); counts[k] = (counts[k] || 0) + 1; }
@@ -1826,10 +1877,9 @@
       try {
         const info = await invoke("mobile_info");
         const u = $("#mob-url"); if (u) u.value = info.url || "";
-        const set = (id, v) => { const e = $("#" + id); if (e) e.textContent = v; };
-        set("mob-ip", info.lan_ip || "—");
-        set("mob-http", info.http_port || "—");
-        set("mob-ws", info.ws_port || "—");
+        setTxt("mob-ip", info.lan_ip || "—");
+        setTxt("mob-http", info.http_port || "—");
+        setTxt("mob-ws", info.ws_port || "—");
       } catch (_) {}
       const m = $("#mobile-modal"); if (m) m.hidden = false;
     });
@@ -2052,7 +2102,7 @@
     if (tog) tog.querySelectorAll(".cvt").forEach((b) => b.addEventListener("click", () => {
       const s = activeSession(); if (!s) return;
       s.convView = (b.dataset.cv === "conv");
-      saveSessionState();
+      scheduleSave();
       showSession(s.id);
     }));
     const input = $("#cx-input");
@@ -2093,13 +2143,8 @@
      ================================================================ */
   function startUptimeTicker() {
     setInterval(() => {
-      const list = $("#lr-session-list");
-      if (list) {
-        list.querySelectorAll(".lr-uptime[data-started]").forEach((node) => {
-          const started = parseInt(node.dataset.started, 10);
-          if (!isNaN(started)) node.textContent = fmtUptime(started);
-        });
-      }
+      // update the uptime spans via the registry rebuilt in renderLeft (no re-query)
+      for (const u of _uptimeNodes) u.node.textContent = fmtUptime(u.started);
       const s = activeSession();
       const valSess = $("#rr-val-sess");
       if (s && valSess) valSess.textContent = fmtUptime(s.startedAt);
@@ -2208,7 +2253,7 @@
       settings.fontSize = Math.min(32, Math.max(8, Math.round((settings.fontSize + d) * 2) / 2));
       saveSettings(); applySettings();
     };
-    const toggleConv = () => { const s = activeSession(); if (!s) return; s.convView = !s.convView; saveSessionState(); showSession(s.id); };
+    const toggleConv = () => { const s = activeSession(); if (!s) return; s.convView = !s.convView; scheduleSave(); showSession(s.id); };
     const clearScrollback = () => { const s = activeSession(); if (s && s.term) { try { s.term.clear(); } catch (_) {} } };
 
     document.addEventListener("keydown", (e) => {
@@ -2273,8 +2318,9 @@
       if (s1) selectSession(s1.id); else showSession(null);
     }
 
-    // persist the session list so a restart / reboot can restore it
-    setInterval(saveSessionState, 2000);
+    // persist the session list so a restart / reboot can restore it. Saves are
+    // now debounced from the session-mutating call sites (scheduleSave); the
+    // beforeunload save is the synchronous backstop for the very last change.
     window.addEventListener("beforeunload", saveSessionState);
   }
 

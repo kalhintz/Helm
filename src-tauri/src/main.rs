@@ -94,7 +94,8 @@ fn pty_spawn(
     surface_id: Option<String>,
     agent: Option<String>,
 ) -> Result<u32, String> {
-    pty_spawn_impl(app, &state, shell, cwd, cols, rows, workspace_id, surface_id, agent)
+    let _ = (workspace_id, surface_id);
+    pty_spawn_impl(app, &state, shell, cwd, cols, rows, agent)
 }
 
 /// Plain impl so both the Tauri command wrapper and the mobile dispatcher can spawn
@@ -109,8 +110,6 @@ fn pty_spawn_impl(
     cwd: Option<String>,
     cols: u16,
     rows: u16,
-    _workspace_id: Option<String>,
-    _surface_id: Option<String>,
     agent: Option<String>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
@@ -146,7 +145,7 @@ fn pty_spawn_impl(
     // pty output -> frontend (per-pty event, base64-framed for xterm.js).
     let app_data = app.clone();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 65536];
         let evt = format!("pty-data:{id}");
         loop {
             match reader.read(&mut buf) {
@@ -262,8 +261,6 @@ pub fn dispatch_mobile_command(
                 stra("cwd"),
                 u16a("cols").unwrap_or(80),
                 u16a("rows").unwrap_or(24),
-                stra("workspaceId"),
-                stra("surfaceId"),
                 stra("agent"),
             );
             match r {
@@ -340,11 +337,17 @@ pub fn dispatch_mobile_command(
     }
 }
 
-#[tauri::command]
-fn app_home() -> String {
+/// Resolve the user's home dir (`%USERPROFILE%`, falling back to `$HOME`). The one
+/// place this env lookup lives; every other home-path helper builds on it.
+pub fn home_var() -> Option<String> {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default()
+        .ok()
+}
+
+#[tauri::command]
+fn app_home() -> String {
+    home_var().unwrap_or_default()
 }
 
 #[tauri::command]
@@ -753,9 +756,7 @@ fn opencode_open_models(port: u16) -> bool {
 
 /// ~/.claude home (.claude config dir parent). Reused by both account commands.
 fn claude_home() -> Option<std::path::PathBuf> {
-    std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()
+    home_var()
         .map(std::path::PathBuf::from)
         .map(|h| h.join(".claude"))
 }
@@ -875,7 +876,7 @@ fn main() {
                         if let Some(c) = h.try_state::<StatsCache>() {
                             *c.0.lock().unwrap() = s;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(2000));
+                        std::thread::sleep(std::time::Duration::from_millis(4000));
                     }
                 });
             }

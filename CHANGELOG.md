@@ -4,6 +4,25 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.8.1] — 2026-06-25
+
+Performance and code-weight pass — same behavior, lighter and faster.
+
+### Changed
+
+- The opencode watcher only queries its (multi-GB) SQLite store when the DB
+  actually changed (size/mtime of the DB + its WAL), with a 3-second safety
+  refresh — an idle opencode session no longer re-queries the database on every
+  tick (~98% fewer idle queries).
+- The mobile bridge skips all event serialization when no phone is connected,
+  removing that work from the PTY output stream and image-heavy messages.
+- The conversation view updates only the message that changed instead of
+  rebuilding the whole transcript; rapid progress updates are coalesced into a
+  single animation frame; session-state saves are debounced; the PTY read buffer
+  is larger and the system-stats poll is less frequent.
+- Internal cleanup: shared home-directory / path / summary helpers and a few
+  dead-code removals, with no behavior change.
+
 ## [0.8.0] — 2026-06-24
 
 ### Added
@@ -221,6 +240,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.8.1]: https://github.com/kalhintz/Helm/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kalhintz/Helm/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kalhintz/Helm/releases/tag/v0.7.0
 [0.6.0]: https://github.com/kalhintz/Helm/releases/tag/v0.6.0
