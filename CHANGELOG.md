@@ -29,6 +29,10 @@ beside the terminal.
   restart or reboot; Claude resumes with `--continue`.
 - **Clipboard** — Ctrl/Cmd+V and Shift+Insert to paste, Ctrl+Shift+C / Cmd+C to
   copy; `Ctrl+C` still interrupts the agent.
+- **Keyboard shortcuts** — session navigation (cycle / jump / new / close),
+  Terminal ⇄ Conversation toggle, clear scrollback, font size, settings, and
+  notifications; chosen so the terminal keeps its own bindings.
+- **Tab attention ring** — a session tab lights up when its agent needs input.
 - **WebGL terminal renderer**, live system CPU/MEM, and settings for terminal
   font, default agent, panel visibility, and restore.
 

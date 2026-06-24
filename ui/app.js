@@ -762,7 +762,7 @@
     if (!bar) return;
     bar.innerHTML = "";
     store.sessions.forEach((s) => {
-      const tab = el("div", "cx-tab" + (s.id === store.activeId ? " active" : ""));
+      const tab = el("div", "cx-tab" + (s.id === store.activeId ? " active" : "") + (s.status === "attention" ? " attention" : ""));
       tab.dataset.id = s.id;
       tab.title = (s.agentLabel || s.shell || "") + " — " + s.title;
       tab.appendChild(el("span", "cx-tab-ic ag-" + (s.agent || "pwsh"), agentIcon(s.agent)));
@@ -1337,8 +1337,51 @@
   /* ================================================================
      MAIN
      ================================================================ */
+  // App-level keyboard shortcuts. Registered on the capture phase so we can claim
+  // a chord before xterm's textarea sees it, but we only ever swallow the chords
+  // we own — plain Ctrl+<letter> stays with the terminal (it's readline's), so we
+  // live in the Ctrl+Shift+<letter> / Ctrl+<digit> / Ctrl+Tab space instead.
+  function wireShortcuts() {
+    const indexOfActive = () => store.sessions.findIndex((s) => s.id === store.activeId);
+    const jump = (i) => { const s = store.sessions[i]; if (s) selectSession(s.id); };
+    const cycle = (dir) => {
+      const n = store.sessions.length; if (!n) return;
+      const cur = indexOfActive();
+      jump((((cur < 0 ? 0 : cur) + dir) % n + n) % n);
+    };
+    const fontStep = (d) => {
+      settings.fontSize = Math.min(32, Math.max(8, Math.round((settings.fontSize + d) * 2) / 2));
+      saveSettings(); applySettings();
+    };
+    const toggleConv = () => { const s = activeSession(); if (!s) return; s.convView = !s.convView; saveSessionState(); showSession(s.id); };
+    const clearScrollback = () => { const s = activeSession(); if (s && s.term) { try { s.term.clear(); } catch (_) {} } };
+
+    document.addEventListener("keydown", (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const k = e.key, shift = e.shiftKey;
+      let handled = true;
+
+      if (k === "Tab") cycle(shift ? -1 : 1);
+      else if (!shift && k >= "1" && k <= "8") jump(parseInt(k, 10) - 1);
+      else if (!shift && k === "9") jump(store.sessions.length - 1);
+      else if (shift && (k === "T" || k === "t")) openNew($("#lr-new-session"));
+      else if (shift && (k === "W" || k === "w")) { if (store.activeId != null) closeSession(store.activeId); }
+      else if (shift && (k === "M" || k === "m")) toggleConv();
+      else if (shift && (k === "K" || k === "k")) clearScrollback();
+      else if (shift && (k === "U" || k === "u")) { const b = $("#tb-bell"); if (b) b.click(); }
+      else if (!shift && k === ",") openSettings();
+      else if (k === "=" || k === "+") fontStep(0.5);
+      else if (k === "-" || k === "_") fontStep(-0.5);
+      else if (!shift && k === "0") { settings.fontSize = DEFAULT_SETTINGS.fontSize; saveSettings(); applySettings(); }
+      else handled = false;
+
+      if (handled) { e.preventDefault(); e.stopPropagation(); }
+    }, true);
+  }
+
   async function main() {
     wireTopbar();
+    wireShortcuts();
     wireHeader();
     wireLeft();
     wireCenter();

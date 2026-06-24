@@ -601,6 +601,7 @@ body {
 .cx-tab-dot[data-st="working"], .cx-tab-dot[data-st="running"], .cx-tab-dot[data-st="active"] { background: var(--green); }
 .cx-tab-dot[data-st="working"] { animation: cx-pulse 1.4s ease-in-out infinite; }
 .cx-tab-dot[data-st="waiting"], .cx-tab-dot[data-st="attention"] { background: var(--orange); }
+.cx-tab.attention { box-shadow: inset 0 0 0 1px rgba(210,153,34,0.55); }
 .cx-tab-dot[data-st="done"] { background: var(--blue); }
 .cx-tab-dot[data-st="error"] { background: var(--red); }
 .cx-tab-dot[data-st="exited"], .cx-tab-dot[data-st="idle"] { background: var(--muted-2); }

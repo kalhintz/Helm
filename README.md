@@ -76,10 +76,36 @@ than full conversation cards.
 
 ## Keyboard & clipboard
 
+`Mod` = `Ctrl` on Windows/Linux, `Cmd` on macOS. App shortcuts deliberately avoid
+plain `Ctrl`+`<letter>` so the terminal keeps its own bindings (readline, etc.).
+
+**Sessions**
+
 | Keys | Action |
 |---|---|
-| `Ctrl`/`Cmd` + `V`, `Shift` + `Insert` | Paste into the terminal |
-| `Ctrl` + `Shift` + `C`, `Cmd` + `C` | Copy the selection |
+| `Ctrl` + `Tab` / `Ctrl` + `Shift` + `Tab` | Next / previous session |
+| `Mod` + `1`–`8` | Jump to session 1–8 |
+| `Mod` + `9` | Jump to the last session |
+| `Mod` + `Shift` + `T` | New session |
+| `Mod` + `Shift` + `W` | Close the active session |
+
+**View & terminal**
+
+| Keys | Action |
+|---|---|
+| `Mod` + `Shift` + `M` | Toggle Terminal ⇄ Conversation |
+| `Mod` + `Shift` + `K` | Clear the terminal scrollback |
+| `Mod` + `Shift` + `U` | Notifications — open panel / jump to latest unread |
+| `Mod` + `,` | Settings |
+| `Mod` + `=` / `Mod` + `-` | Increase / decrease font size |
+| `Mod` + `0` | Reset font size |
+
+**Clipboard**
+
+| Keys | Action |
+|---|---|
+| `Mod` + `V`, `Shift` + `Insert` | Paste into the terminal |
+| `Mod` + `Shift` + `C`, `Cmd` + `C` | Copy the selection |
 | `Ctrl` + `C` | Pass through to interrupt the agent |
 
 Paste honors bracketed-paste mode, so a multi-line path lands as a single chunk
