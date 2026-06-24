@@ -37,6 +37,7 @@ fn dir_signal(dir: &Path) -> (Option<notify::RecommendedWatcher>, Receiver<()>) 
     (watcher, rx)
 }
 
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::AppHandle;
@@ -51,6 +52,19 @@ pub struct AgentProgress {
     pub todos: Vec<TodoItem>,
     pub tools: Vec<ToolEvent>,
     pub context: Option<Context>,
+    /// opencode-only: cleaned display mode/agent (e.g. "Sisyphus - Ultraworker").
+    /// `skip` keeps the Claude/Codex payloads byte-identical.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    /// opencode-only: modelID (e.g. "claude-opus-4-8").
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// opencode-only: providerID (e.g. "anthropic").
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// opencode-only: bound session id, so the frontend can drive the switch API.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sid: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -666,6 +680,7 @@ impl ClaudeState {
             todos,
             tools,
             context,
+            ..Default::default()
         }
     }
 
@@ -1110,7 +1125,7 @@ impl CodexState {
             None
         };
         let tools = self.tools.iter().rev().take(20).rev().cloned().collect();
-        AgentProgress { status: status.into(), activity, todos: self.todos.clone(), tools, context }
+        AgentProgress { status: status.into(), activity, todos: self.todos.clone(), tools, context, ..Default::default() }
     }
     fn signature(&self, p: &AgentProgress) -> String {
         let last_ts = self.tools.last().map(|t| t.ts.as_str()).unwrap_or("");
@@ -1141,6 +1156,68 @@ fn opencode_root() -> Option<PathBuf> {
         .find(|p| p.exists())
         .cloned()
         .or_else(|| candidates.into_iter().next())
+}
+
+/// Path to opencode's SQLite store (a multi-GB WAL DB). We open it READ-ONLY so a
+/// concurrent opencode writer is never blocked.
+fn opencode_db_path() -> Option<PathBuf> {
+    let p = opencode_root()?.join("opencode.db");
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Open opencode.db read-only. WAL readers don't block the writer; never set
+/// journal_mode on a read-only handle. busy_timeout keeps us from erroring out
+/// if a checkpoint briefly holds a lock.
+fn open_opencode_db(path: &Path) -> Option<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(Duration::from_millis(300));
+    Some(conn)
+}
+
+/// opencode's mode/agent strings carry a leading zero-width space (U+200B); strip
+/// it (and surrounding whitespace) so the chip reads "Sisyphus - Ultraworker".
+fn clean_mode(s: &str) -> String {
+    s.trim_start_matches('\u{200b}').trim().to_string()
+}
+
+/// Context window (max tokens) for a model. Prefer the live `/api/model`
+/// `limit.context` at runtime; this is the offline fallback when the HTTP API
+/// isn't reachable.
+fn model_context_max(model_id: &str) -> u64 {
+    match model_id {
+        "claude-opus-4-8" | "claude-opus-4-7" | "claude-sonnet-4-6" => 1_000_000,
+        "claude-haiku-4-5" => 200_000,
+        "claude-fable-5" => 100_000,
+        "gpt-5.5" | "gpt-5.5-pro" => 200_000,
+        "gpt-5.4" | "gpt-5.4-mini" => 128_000,
+        "gpt-5.3-codex" => 100_000,
+        "gemini-3.1-pro-preview" | "gemini-3-flash-preview" => 1_000_000,
+        _ => 200_000,
+    }
+}
+
+/// Newest non-archived session whose directory matches `cwd` (normalize
+/// backslash->slash, lowercase). Returns (session_id, directory). Always LIMIT —
+/// the DB is huge.
+fn db_bind_session(conn: &Connection, cwd: &str) -> Option<(String, String)> {
+    let norm = cwd.replace('\\', "/").to_lowercase();
+    conn.query_row(
+        "SELECT id, directory FROM session
+         WHERE LOWER(REPLACE(directory,'\\','/')) = ?1
+           AND time_archived IS NULL
+         ORDER BY time_updated DESC LIMIT 1",
+        [norm],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )
+    .ok()
 }
 
 /// Configured opencode plugins + MCP servers from ~/.config/opencode/opencode.json
@@ -1241,9 +1318,29 @@ fn base_name(path: &str) -> String {
         .to_string()
 }
 
+/// One-line summary for an opencode tool part's `state.input`
+/// (filePath / command / pattern / description), mirroring summarize_input.
+fn oc_tool_summary(input: &Value) -> String {
+    for k in ["filePath", "file_path", "command", "pattern", "query", "description", "url", "path"] {
+        if let Some(s) = input[k].as_str() {
+            let s = s.trim().replace(['\n', '\r'], " ");
+            if !s.is_empty() {
+                // file-ish keys read better as a basename
+                let v = if k.contains("ath") || k == "filePath" { base_name(&s) } else { s };
+                return v.chars().take(60).collect();
+            }
+        }
+    }
+    String::new()
+}
+
 fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let Some(root) = opencode_root() else { return };
     let evt = format!("agent-progress:{pty_id}");
+
+    // Open the SQLite store once, read-only. It owns conversation/todos/context/
+    // mode/model/status; the logfmt tail stays as an instant file-op fallback.
+    let db = opencode_db_path().and_then(|p| open_opencode_db(&p));
 
     let mut sid = String::new();
     let mut logpath: Option<PathBuf> = None;
@@ -1256,14 +1353,23 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let (_fs_watch, fs_rx) = dir_signal(&root);
 
     loop {
-        let _ = fs_rx.recv_timeout(Duration::from_millis(1200));
+        // tighter cadence than the other watchers so conversation feels live.
+        let _ = fs_rx.recv_timeout(Duration::from_millis(900));
 
         if sid.is_empty() {
-            sid = resolve_opencode_sid(&root, &cwd).unwrap_or_default();
+            // Prefer the DB binder (no lock under WAL read); fall back to the JSON scan.
+            sid = db
+                .as_ref()
+                .and_then(|c| db_bind_session(c, &cwd))
+                .map(|(id, _dir)| id)
+                .or_else(|| resolve_opencode_sid(&root, &cwd))
+                .unwrap_or_default();
             if sid.is_empty() {
                 continue;
             }
             state.sid = sid.clone();
+            state.emitted_msgs.clear();
+            emit_all(&app, &format!("conv-reset:{pty_id}"), ());
             // surface configured plugins/MCP as chips (purple, mcp__ prefix)
             for name in read_opencode_plugins() {
                 state.push_tool(&format!("mcp__{name}"), "plugin");
@@ -1277,34 +1383,37 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
                 offset = 0;
             }
         }
-        let Some(lp) = logpath.clone() else { continue };
 
         let mut saw = false;
-        if let Ok(mut f) = File::open(&lp) {
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len < offset {
-                offset = 0;
-            }
-            if len > offset && f.seek(SeekFrom::Start(offset)).is_ok() {
-                let mut buf = String::new();
-                if f.read_to_string(&mut buf).is_ok() {
-                    if let Some(idx) = buf.rfind('\n') {
-                        let complete = &buf[..=idx];
-                        for line in complete.split('\n') {
-                            let t = line.trim();
-                            if t.is_empty() {
-                                continue;
+        if let Some(lp) = logpath.clone() {
+            if let Ok(mut f) = File::open(&lp) {
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                if len < offset {
+                    offset = 0;
+                }
+                if len > offset && f.seek(SeekFrom::Start(offset)).is_ok() {
+                    let mut buf = String::new();
+                    if f.read_to_string(&mut buf).is_ok() {
+                        if let Some(idx) = buf.rfind('\n') {
+                            let complete = &buf[..=idx];
+                            for line in complete.split('\n') {
+                                let t = line.trim();
+                                if t.is_empty() {
+                                    continue;
+                                }
+                                if state.ingest(t) {
+                                    saw = true;
+                                }
                             }
-                            if state.ingest(t) {
-                                saw = true;
-                            }
+                            offset += complete.as_bytes().len() as u64;
                         }
-                        offset += complete.as_bytes().len() as u64;
                     }
                 }
             }
         }
 
+        // logfmt fast-path status (only used when the DB has no row yet — see
+        // mapped_status). Keep updating it so the fallback stays meaningful.
         if state.canceled {
             state.status = "idle".into();
             state.canceled = false;
@@ -1313,18 +1422,22 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
             state.status = "working".into();
             idle_polls = 0;
         } else {
-            // opencode logs nothing while the model is generating, so keep a
-            // generous grace window before declaring idle (else it flips to
-            // 대기 mid-turn). ~20s at the 700ms poll cadence.
             idle_polls = idle_polls.saturating_add(1);
             if idle_polls >= 28 {
                 state.status = "idle".into();
             }
         }
 
-        // opencode exposes no message bodies — surface its activity as a system
-        // event stream so the 대화 view shows what it is doing.
-        if !state.activity.is_empty() && state.activity != last_activity {
+        // The DB is authoritative: mode/model/context/todos/status + conversation.
+        // Conversation is always emitted from the DB; the frontend's
+        // `showConversation` setting decides whether to render it.
+        if let Some(conn) = db.as_ref() {
+            state.db_sync(&app, conn, pty_id, true);
+        }
+
+        // Fallback conversation: only when the DB is absent — surface logfmt
+        // activity as a system event so the 대화 view isn't empty.
+        if db.is_none() && !state.activity.is_empty() && state.activity != last_activity {
             last_activity = state.activity.clone();
             conv_seq += 1;
             let m = ConvMessage {
@@ -1343,28 +1456,57 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
         let sig = state.signature(&prog);
         if sig != last_sig {
             last_sig = sig;
-            // Once native hooks are live for this pty they own status/activity/todos;
-            // the watcher then contributes only token context (and conversation).
-            if crate::hook_server::hooks_active(&app, pty_id) {
-                emit_all(&app, &evt, serde_json::json!({ "context": prog.context }));
-            } else {
-                emit_all(&app, &evt, &prog);
+            // The DB watcher is AUTHORITATIVE for opencode — it owns conversation,
+            // tasks, context, mode/model AND status (none of which the helm-bridge
+            // hook carries). So, like the Codex arm, always emit the full progress
+            // even when the hook is live; the hook just adds an earlier nudge.
+            emit_all(&app, &evt, &prog);
+        }
+
+        // ---- notification edge-trigger: turn complete (working -> awaiting) ----
+        if state.prev_db_status == "working" && state.db_status == "awaiting_input" {
+            let now = now_ms();
+            if now.saturating_sub(state.last_turn_done_ms) >= 2000 {
+                state.last_turn_done_ms = now;
+                emit_all(
+                    &app,
+                    &format!("agent-turn-done:{pty_id}"),
+                    serde_json::json!({ "title": state.mode, "model": state.model }),
+                );
             }
         }
+        state.prev_db_status = state.db_status.clone();
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
 struct OpencodeState {
     sid: String,
+    // logfmt fast-path (instant file-op activity before the DB row lands):
     active_run: String,
     status: String,
     activity: String,
-    model: String,
+    model: String, // modelID (DB-authoritative; logfmt stream= as fallback)
     step: u64,
     canceled: bool,
     tools: Vec<ToolEvent>,
     tool_keys: HashSet<String>,
+    // DB-sourced (authoritative for conversation / todos / context / mode):
+    mode: String,
+    provider: String,
+    context: Option<Context>,
+    todos: Vec<TodoItem>,
+    emitted_msgs: HashSet<String>, // message ids already sent as a FINAL conv-msg
+    db_status: String,             // working | awaiting_input | queued | idle
+    prev_db_status: String,        // edge-trigger for turn-done notifications
+    last_turn_done_ms: u64,
 }
 impl OpencodeState {
     /// Returns true when the line advanced OUR session (drives working/idle).
@@ -1438,8 +1580,275 @@ impl OpencodeState {
         }
     }
 
+    /// Pull the authoritative state for our bound session out of opencode.db:
+    /// mode/model/provider, token context, todos, status — and emit conv-msg /
+    /// conv-tool for the conversation view. Every query is LIMITed (huge DB).
+    fn db_sync(&mut self, app: &AppHandle, conn: &Connection, pty_id: u32, emit_conv: bool) {
+        if self.sid.is_empty() {
+            return;
+        }
+
+        // ---- latest assistant message: mode / model / provider / status ----
+        let latest_assistant: Option<Value> = conn
+            .query_row(
+                "SELECT data FROM message
+                 WHERE session_id = ?1 AND json_extract(data,'$.role')='assistant'
+                 ORDER BY time_created DESC LIMIT 1",
+                [&self.sid],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+        if let Some(d) = &latest_assistant {
+            if let Some(m) = d["mode"].as_str().or_else(|| d["agent"].as_str()) {
+                let cleaned = clean_mode(m);
+                if !cleaned.is_empty() {
+                    self.mode = cleaned;
+                }
+            }
+            if let Some(m) = d["modelID"].as_str() {
+                if !m.is_empty() {
+                    self.model = m.to_string();
+                }
+            }
+            if let Some(p) = d["providerID"].as_str() {
+                if !p.is_empty() {
+                    self.provider = p.to_string();
+                }
+            }
+        }
+
+        // ---- context: newest non-zero tokens.total across assistant messages ----
+        // The very latest message can be mid-stream/aborted (tokens all zero), so
+        // take the newest assistant whose tokens.total > 0.
+        let used: Option<u64> = conn
+            .query_row(
+                "SELECT json_extract(data,'$.tokens.total') FROM message
+                 WHERE session_id = ?1 AND json_extract(data,'$.role')='assistant'
+                   AND COALESCE(json_extract(data,'$.tokens.total'),0) > 0
+                 ORDER BY time_created DESC LIMIT 1",
+                [&self.sid],
+                |r| r.get::<_, Option<u64>>(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(u) = used {
+            if u > 0 {
+                let max = model_context_max(&self.model);
+                let pct = ((u as f64 / max as f64) * 100.0).round().min(100.0) as u8;
+                self.context = Some(Context { used: u, max, pct });
+            }
+        }
+
+        // ---- todos ----
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT content, status FROM todo WHERE session_id = ?1 ORDER BY position")
+        {
+            if let Ok(rows) = stmt.query_map([&self.sid], |r| {
+                Ok(TodoItem {
+                    text: r.get::<_, String>(0)?,
+                    status: r.get::<_, String>(1)?,
+                })
+            }) {
+                let todos: Vec<TodoItem> = rows.flatten().collect();
+                self.todos = todos;
+            }
+        }
+
+        // ---- status detection ----
+        // latest message overall (user or assistant) decides who owes the next move.
+        let latest: Option<(String, Value)> = conn
+            .query_row(
+                "SELECT json_extract(data,'$.role'), data FROM message
+                 WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 1",
+                [&self.sid],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok()
+            .and_then(|(role, s)| serde_json::from_str::<Value>(&s).ok().map(|v| (role, v)));
+
+        let mut db_status = "idle".to_string();
+        if let Some((role, d)) = &latest {
+            if role == "assistant" {
+                let done = !d["finish"].is_null() || !d["error"].is_null();
+                db_status = if done { "awaiting_input" } else { "working" }.to_string();
+            } else if role == "user" {
+                // assistant owes a reply
+                db_status = "working".to_string();
+            }
+        }
+        // queued input overrides — still busy, and suppresses the awaiting toast.
+        let queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_input WHERE session_id = ?1 AND promoted_seq IS NULL",
+                [&self.sid],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if queued > 0 {
+            db_status = "queued".to_string();
+        }
+        self.db_status = db_status;
+
+        // ---- conversation reconstruction (gated on the setting via emit_conv) ----
+        if emit_conv {
+            self.db_emit_conversation(app, conn, pty_id);
+        }
+    }
+
+    /// Build ConvMessages for the newest ~40 messages and emit conv-msg for any
+    /// not yet emitted as final. Streaming messages (finish==null) are emitted but
+    /// NOT marked final, so the completed version later replaces them (frontend
+    /// de-dupes by id).
+    fn db_emit_conversation(&mut self, app: &AppHandle, conn: &Connection, pty_id: u32) {
+        let mut stmt = match conn.prepare(
+            "SELECT m.id, m.time_created, m.data, p.time_created, p.data
+             FROM message m
+             LEFT JOIN part p ON p.message_id = m.id
+             WHERE m.id IN (
+                 SELECT id FROM message WHERE session_id = ?1
+                 ORDER BY time_created DESC LIMIT 40
+             )
+             ORDER BY m.time_created, p.time_created",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rows = match stmt.query_map([&self.sid], |r| {
+            Ok((
+                r.get::<_, String>(0)?,            // message id
+                r.get::<_, i64>(1)?,               // message ts
+                r.get::<_, String>(2)?,            // message data
+                r.get::<_, Option<String>>(4)?,    // part data (may be null)
+            ))
+        }) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        // group parts under each message, preserving order
+        let mut order: Vec<String> = Vec::new();
+        let mut by_msg: HashMap<String, (i64, Value, Vec<Value>)> = HashMap::new();
+        for row in rows.flatten() {
+            let (mid, ts, mdata, pdata) = row;
+            let entry = by_msg.entry(mid.clone()).or_insert_with(|| {
+                order.push(mid.clone());
+                let mv = serde_json::from_str::<Value>(&mdata).unwrap_or(Value::Null);
+                (ts, mv, Vec::new())
+            });
+            if let Some(pd) = pdata {
+                if let Ok(pv) = serde_json::from_str::<Value>(&pd) {
+                    entry.2.push(pv);
+                }
+            }
+        }
+
+        for mid in order {
+            let Some((ts, mdata, parts)) = by_msg.remove(&mid) else { continue };
+            if mdata.is_null() {
+                continue;
+            }
+            let role = mdata["role"].as_str().unwrap_or("assistant").to_string();
+            let mut text = String::new();
+            let mut thinking = String::new();
+            let mut tool_calls: Vec<ConvToolCall> = Vec::new();
+            for p in &parts {
+                match p["type"].as_str().unwrap_or("") {
+                    "text" => {
+                        if let Some(t) = p["text"].as_str() {
+                            if !t.is_empty() {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    "reasoning" => {
+                        if let Some(t) = p["text"].as_str() {
+                            if !t.is_empty() {
+                                if !thinking.is_empty() {
+                                    thinking.push('\n');
+                                }
+                                thinking.push_str(t);
+                            }
+                        }
+                    }
+                    "tool" => {
+                        let st = &p["state"];
+                        let status = match st["status"].as_str().unwrap_or("") {
+                            "completed" => "completed",
+                            "error" => "error",
+                            _ => "running",
+                        };
+                        let result = st["output"]
+                            .as_str()
+                            .or_else(|| st["metadata"]["preview"].as_str())
+                            .map(|s| truncate_str(s, 2000));
+                        tool_calls.push(ConvToolCall {
+                            id: p["callID"].as_str().unwrap_or("").to_string(),
+                            name: p["tool"].as_str().unwrap_or("tool").to_string(),
+                            summary: oc_tool_summary(&st["input"]),
+                            status: status.to_string(),
+                            result,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if text.is_empty() && thinking.is_empty() && tool_calls.is_empty() {
+                continue;
+            }
+            let usage = if role == "assistant" {
+                mdata["tokens"]["total"].as_u64().filter(|t| *t > 0).map(|used| ConvUsage {
+                    used,
+                    max: model_context_max(mdata["modelID"].as_str().unwrap_or("")),
+                })
+            } else {
+                None
+            };
+            let finished = !mdata["finish"].is_null() || !mdata["error"].is_null() || role == "user";
+            // re-emit streaming messages every tick; only suppress finals we've sent.
+            if finished && self.emitted_msgs.contains(&mid) {
+                continue;
+            }
+            let m = ConvMessage {
+                id: mid.clone(),
+                role,
+                ts: ts.to_string(),
+                text,
+                thinking: if thinking.is_empty() { None } else { Some(thinking) },
+                tool_calls,
+                usage,
+            };
+            emit_all(app, &format!("conv-msg:{pty_id}"), &m);
+            if finished {
+                self.emitted_msgs.insert(mid);
+            }
+        }
+    }
+
+    /// Map the DB-derived state to the frontend status vocabulary
+    /// (working | waiting | idle). The watcher is authoritative for opencode.
+    fn mapped_status(&self) -> &str {
+        match self.db_status.as_str() {
+            "working" | "queued" => "working",
+            "awaiting_input" => "waiting",
+            "idle" => "idle",
+            // No DB row yet — fall back to the logfmt fast-path.
+            _ => {
+                if self.status.is_empty() {
+                    "idle"
+                } else {
+                    self.status.as_str()
+                }
+            }
+        }
+    }
+
     fn to_progress(&self) -> AgentProgress {
-        let status = if self.status.is_empty() { "idle" } else { self.status.as_str() };
+        let status = self.mapped_status();
         let activity = if status == "working" {
             if !self.activity.is_empty() {
                 self.activity.clone()
@@ -1466,13 +1875,35 @@ impl OpencodeState {
         AgentProgress {
             status: status.into(),
             activity,
-            todos: vec![],
+            todos: self.todos.clone(),
             tools,
-            context: None,
+            context: self.context.clone(),
+            mode: self.mode.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            sid: self.sid.clone(),
         }
     }
 
     fn signature(&self, p: &AgentProgress) -> String {
-        format!("{}|{}|{}|{}", p.status, p.activity, self.tools.len(), self.step)
+        let todo_sig: String = self
+            .todos
+            .iter()
+            .map(|t| format!("{}/{};", t.text, t.status))
+            .collect();
+        let ctx = self.context.as_ref().map(|c| c.used).unwrap_or(0);
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            p.status,
+            p.activity,
+            self.tools.len(),
+            self.step,
+            self.mode,
+            self.model,
+            ctx,
+            todo_sig,
+            self.emitted_msgs.len(),
+            self.db_status,
+        )
     }
 }

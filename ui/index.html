@@ -153,6 +153,10 @@
               <span class="rr-info-key">에이전트</span>
               <span class="rr-info-val" id="rr-sess-agent">—</span>
             </div>
+            <div class="rr-info-row" id="rr-sess-mode-row" hidden>
+              <span class="rr-info-key">모드</span>
+              <span class="rr-info-val" id="rr-sess-mode">—</span>
+            </div>
             <div class="rr-info-row">
               <span class="rr-info-key">상태</span>
               <span class="rr-info-val" id="rr-sess-status">—</span>
@@ -297,6 +301,13 @@
             <label><input type="checkbox" class="set-show" data-sec="tools" /> 도구/플러그인</label>
             <label><input type="checkbox" class="set-show" data-sec="usage" /> USAGE</label>
             <label><input type="checkbox" class="set-show" data-sec="timeline" /> 타임라인</label>
+          </div>
+          <div class="set-group-label">opencode</div>
+          <div class="set-checks">
+            <label><input type="checkbox" id="set-oc-turndone" /> 턴 완료 알림</label>
+            <label><input type="checkbox" id="set-oc-awaiting" /> 입력 대기 알림</label>
+            <label><input type="checkbox" id="set-oc-conv" /> 대화 기록 표시</label>
+            <label><input type="checkbox" id="set-oc-apiswitch" /> API 모델/에이전트 전환</label>
           </div>
         </div>
         <div class="modal-foot">

@@ -748,6 +748,13 @@ body.hide-timeline [data-sec="timeline"] { display: none; }
 .tv-meta-agent { color: var(--text-dim); font-weight: 500; flex-shrink: 0; }
 .tv-meta-folder, .tv-meta-branch { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.tv-mode { display: flex; align-items: center; gap: 6px; margin: -2px 0 10px; font-size: 11px; color: var(--text-dim); overflow: hidden; }
+.tv-mode-label { color: var(--muted); font-weight: 500; flex-shrink: 0; }
+.tv-mode-val { color: var(--text-dim); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tv-mode-sep { color: var(--muted-2); flex-shrink: 0; }
+.tv-mode-model { flex-shrink: 0; font-family: var(--mono-font); font-size: 10px; color: var(--muted);
+  background: var(--secondary); padding: 1px 6px; border-radius: var(--r-sm); }
+
 .tv-activity { display: flex; align-items: flex-start; gap: 7px; margin: -3px 0 11px; font-size: 11.5px; color: var(--text-dim); line-height: 1.45; }
 .tv-activity-mark { flex-shrink: 0; font-weight: 800; color: var(--muted-2); }
 .tv-activity-mark.is-working { color: var(--orange); }
@@ -786,6 +793,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .cx-quick-menu { position: fixed; z-index: 200; background: var(--card-bg); border: 1px solid var(--border-strong); border-radius: var(--r-md); box-shadow: var(--shadow-pop); padding: 4px; display: flex; flex-direction: column; min-width: 130px; }
 .cx-quick-mi { text-align: left; font-size: 12px; color: var(--text-dim); background: transparent; border: none; border-radius: var(--r-sm); padding: 6px 10px; cursor: pointer; }
 .cx-quick-mi:hover { background: var(--accent-soft); color: var(--text); }
+
+/* opencode mode + model chip (composer quick-controls) */
+.cx-mode-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted);
+  background: var(--secondary); border: 1px solid var(--border); border-radius: var(--r-pill);
+  padding: 3px 9px; white-space: nowrap; flex-shrink: 0; }
+.cx-mode-chip-mode { color: var(--text-dim); font-weight: 600; }
+.cx-mode-chip-model { font-family: var(--mono-font); }
+.cx-mode-chip-sep { color: var(--muted-2); }
+.cx-mode-chip-pending { color: var(--purple); font-size: 9px; font-weight: 600; }
 
 /* mobile-connect modal */
 .mob-help { font-size: 12.5px; color: var(--text-dim); margin: 0 0 12px; line-height: 1.5; }

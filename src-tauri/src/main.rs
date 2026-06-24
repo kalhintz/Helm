@@ -34,6 +34,23 @@ struct PtyState {
     next: Mutex<u32>,
 }
 
+/// pty_id -> opencode HTTP API port. Helm owns the port: it launches each
+/// opencode session as `opencode --port <FREE> --hostname 127.0.0.1`, so the
+/// bare TUI itself serves the API (no side-car). The frontend reads this to
+/// drive model/agent switching against the live session.
+#[derive(Default)]
+struct OcPorts(Mutex<HashMap<u32, u16>>);
+
+/// Bind a TcpListener to 127.0.0.1:0, read the OS-assigned port, drop the
+/// listener, and hand the port to opencode. There's a tiny TOCTOU race, but
+/// opencode rebinds within milliseconds so it's safe in practice.
+fn pick_free_port() -> Option<u16> {
+    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    let port = l.local_addr().ok()?.port();
+    drop(l);
+    Some(port)
+}
+
 #[derive(Clone, Serialize)]
 struct DataPayload {
     b64: String,
@@ -186,8 +203,9 @@ fn pty_resize_impl(state: &PtyState, id: u32, cols: u16, rows: u16) -> Result<()
 }
 
 #[tauri::command]
-fn pty_kill(state: State<PtyState>, id: u32) {
+fn pty_kill(state: State<PtyState>, ocports: State<OcPorts>, id: u32) {
     state.map.lock().unwrap().remove(&id);
+    ocports.0.lock().unwrap().remove(&id);
 }
 
 /// Read an image from the OS clipboard (if any), write it to a temp PNG, and
@@ -501,6 +519,76 @@ fn parse_http_json(buf: &[u8]) -> Option<Value> {
     serde_json::from_str::<Value>(body.trim()).ok()
 }
 
+/// Dependency-free HTTP/1.1 POST of a JSON body to a localhost service. Returns
+/// the parsed JSON response on a 2xx, or None on any error / non-2xx — callers
+/// treat None as "switch not applied" and fall back to the native picker.
+fn http_post_json(port: u16, path: &str, body: &Value) -> Option<Value> {
+    let payload = serde_json::to_string(body).ok()?;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+    s.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.as_bytes().len(),
+        payload
+    );
+    s.write_all(req.as_bytes()).ok()?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break
+            }
+            Err(_) => break,
+        }
+        if buf.len() > 1_000_000 {
+            break;
+        }
+    }
+    // require a 2xx status line
+    let head = String::from_utf8_lossy(&buf);
+    let status_ok = head
+        .lines()
+        .next()
+        .map(|l| l.contains(" 2"))
+        .unwrap_or(false);
+    if !status_ok {
+        return None;
+    }
+    parse_http_json(&buf).or(Some(Value::Null))
+}
+
+/// The real switch: opencode has no "set model" endpoint, but its prompt route
+/// `POST /session/{id}/message` carries first-class `model` + `agent` fields that
+/// it persists. We don't send a user turn here — instead the frontend routes the
+/// composer's *next* send through the selected model/agent. This command is the
+/// generic poster used by the switch commands; returns true on 2xx.
+fn opencode_post_message(
+    port: u16,
+    session_id: &str,
+    model: Option<(String, String)>, // (providerID, modelID)
+    agent: Option<String>,
+    text: &str,
+) -> bool {
+    let mut body = serde_json::json!({
+        "parts": [{ "type": "text", "text": text }]
+    });
+    if let Some((provider, model_id)) = model {
+        body["model"] = serde_json::json!({ "providerID": provider, "modelID": model_id });
+    }
+    if let Some(a) = agent {
+        body["agent"] = Value::String(a);
+    }
+    let path = format!("/session/{session_id}/message");
+    http_post_json(port, &path, &body).is_some()
+}
+
 fn dechunk(body: &str) -> String {
     let mut out = String::new();
     let mut rest = body;
@@ -574,11 +662,83 @@ fn read_usage_cards(port: u16) -> Option<Vec<UsageCard>> {
     Some(vec![UsageCard { account, plan, extra, rows }])
 }
 
+// ===== opencode HTTP API integration (model/agent listing + real switching) =====
+
+/// Allocate a free localhost port for a new opencode session and remember it under
+/// `pty_id`. The frontend launches `opencode --port <ret> --hostname 127.0.0.1`, so
+/// the bare TUI serves the API itself — no side-car. Returns 0 if no port is free.
+#[tauri::command]
+fn opencode_alloc_port(pty_id: u32, ports: State<OcPorts>) -> u16 {
+    let p = pick_free_port().unwrap_or(0);
+    if p != 0 {
+        ports.0.lock().unwrap().insert(pty_id, p);
+    }
+    p
+}
+
+/// The opencode API port previously allocated for this pty (0 if none).
+#[tauri::command]
+fn opencode_port_for(pty_id: u32, ports: State<OcPorts>) -> u16 {
+    *ports.0.lock().unwrap().get(&pty_id).unwrap_or(&0)
+}
+
+/// GET /api/model -> the model list (id, name, providerID, limit.context, ...).
+#[tauri::command]
+fn opencode_models(port: u16) -> Vec<Value> {
+    http_get_json(port, "/api/model")
+        .and_then(|v| v["data"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// GET /api/agent -> the agent list (build/plan/general + oh-my-openagent ones).
+#[tauri::command]
+fn opencode_agents(port: u16) -> Vec<Value> {
+    http_get_json(port, "/api/agent")
+        .and_then(|v| v["data"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// The real switch: POST a composer turn through `/session/{id}/message` carrying
+/// the selected `model` {providerID,modelID} and/or `agent`. opencode persists
+/// them, so this both sends the message AND switches the session. Returns true on
+/// 2xx; the frontend falls back to the native picker on false.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn opencode_send(
+    port: u16,
+    session_id: String,
+    text: String,
+    model_id: Option<String>,
+    provider: Option<String>,
+    agent: Option<String>,
+) -> bool {
+    if port == 0 || session_id.is_empty() {
+        return false;
+    }
+    let model = match (provider, model_id) {
+        (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => Some((p, m)),
+        _ => None,
+    };
+    let agent = agent.filter(|a| !a.is_empty());
+    opencode_post_message(port, &session_id, model, agent, &text)
+}
+
+/// POST /tui/open-models — opens opencode's native model picker in the running
+/// TUI. A bonus affordance / fallback when the API switch can't be applied.
+#[tauri::command]
+fn opencode_open_models(port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
+    http_post_json(port, "/tui/open-models", &Value::Null).is_some()
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(PtyState::default())
+        .manage(OcPorts::default())
         .manage(hook_server::HookHub::default())
         .manage(mobile::Bus::default())
         .manage(mobile::MobileState::default())
@@ -650,6 +810,12 @@ fn main() {
             system_stats,
             start_agent_watch,
             usage_cards,
+            opencode_alloc_port,
+            opencode_port_for,
+            opencode_models,
+            opencode_agents,
+            opencode_send,
+            opencode_open_models,
             mobile::mobile_info
         ])
         .run(tauri::generate_context!())

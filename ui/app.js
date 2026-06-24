@@ -109,8 +109,68 @@
       { label: "에이전트", cmd: "/agents" },
     ],
     codex: [{ label: "모델·추론", cmd: "/model" }, { label: "승인", cmd: "/approvals" }],
-    opencode: [{ label: "모델", cmd: "/models" }, { label: "에이전트", cmd: "/agent" }],
+    // opencode controls are built dynamically from its HTTP API — see
+    // buildOpencodeControls(); this entry is intentionally empty.
+    opencode: [],
   };
+
+  /* ---- opencode model/agent switching via its HTTP API (the real switch) ----
+     opencode has no "set model" endpoint, but its prompt route
+     POST /session/{id}/message carries first-class model+agent fields that it
+     persists. So picking a model/agent here records a pending selection (shown in
+     the chip) that the composer's NEXT send applies via opencode_send — really
+     switching the live session, not injecting a slash command. */
+  async function buildOpencodeControls(session) {
+    if (settings.opencode && settings.opencode.apiSwitch === false) return [];
+    let port = session._ocPort || 0;
+    if (!port && session.ptyId != null) {
+      try { port = await invoke("opencode_port_for", { ptyId: session.ptyId }); } catch (_) { port = 0; }
+    }
+    if (!port) return [];
+    session._ocPort = port;
+    let models = [], agents = [];
+    try {
+      [models, agents] = await Promise.all([
+        invoke("opencode_models", { port }).catch(() => []),
+        invoke("opencode_agents", { port }).catch(() => []),
+      ]);
+    } catch (_) {}
+    const controls = [];
+    if (models.length) {
+      controls.push({ label: "모델", menu: models.map((m) => ({
+        label: m.name || m.id,
+        action: () => selectOcModel(session, m.id, m.providerID || m.provider || ""),
+      })) });
+    }
+    if (agents.length) {
+      controls.push({ label: "에이전트", menu: agents.map((a) => {
+        const id = a.name || a.id || "";
+        return { label: id.replace(/^​/, ""), action: () => selectOcAgent(session, id) };
+      }) });
+    }
+    // native picker affordance (opens opencode's own model picker in the TUI)
+    controls.push({ label: "네이티브 ▸", action: () => openOcNativeModels(session) });
+    return controls;
+  }
+  function selectOcModel(session, id, provider) {
+    session.ocPendingModel = id;
+    session.ocPendingProvider = provider || "";
+    session.currentModel = id;            // optimistic; re-syncs from agent-progress
+    pushTimeline(session, "모델 선택: " + id + " (다음 전송 시 적용)", "purple");
+    if (store.activeId === session.id) { renderQuickControls(session).catch(() => {}); App.renderRight(); }
+  }
+  function selectOcAgent(session, id) {
+    session.ocPendingAgent = id;
+    const clean = (id || "").replace(/^​/, "");
+    session.currentMode = clean;          // optimistic
+    pushTimeline(session, "에이전트 선택: " + clean + " (다음 전송 시 적용)", "purple");
+    if (store.activeId === session.id) { renderQuickControls(session).catch(() => {}); App.renderRight(); }
+  }
+  async function openOcNativeModels(session) {
+    const port = session._ocPort || 0;
+    if (port) { try { await invoke("opencode_open_models", { port }); return; } catch (_) {} }
+    sendCmd("/models"); // fallback if the API isn't reachable
+  }
   const statusLabel = (st) => ({ spawning: "시작 중", running: "실행 중", active: "실행 중", attention: "입력 대기", idle: "대기", error: "오류", exited: "종료" }[st] || st);
 
   /* ================================================================
@@ -153,6 +213,12 @@
     fontSize: 12.5, cursorBlink: true, defaultAgent: "ask", statsInterval: 2000,
     restoreSessions: true,
     show: { progress: true, todos: true, tools: true, usage: true, timeline: true },
+    opencode: {
+      notifyTurnDone: true,   // toast when an opencode turn completes
+      notifyAwaiting: true,   // toast when opencode awaits prompt input
+      showConversation: true, // render the DB-sourced conversation in 대화 view
+      apiSwitch: true,        // expose API-backed model/agent switching
+    },
   };
   const SESSIONS_KEY = "helm.sessions";
   function saveSessionState() {
@@ -174,6 +240,7 @@
     try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); } catch (_) { s = {}; }
     const merged = Object.assign({}, DEFAULT_SETTINGS, s);
     merged.show = Object.assign({}, DEFAULT_SETTINGS.show, s.show || {});
+    merged.opencode = Object.assign({}, DEFAULT_SETTINGS.opencode, s.opencode || {});
     return merged;
   }
   function saveSettings() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (_) {} }
@@ -205,6 +272,12 @@
     if (st) st.value = String(settings.statsInterval);
     $$(".set-show").forEach((cb) => { cb.checked = !!settings.show[cb.dataset.sec]; });
     const rs = $("#set-restore"); if (rs) rs.checked = !!settings.restoreSessions;
+    const ococ = settings.opencode || {};
+    const ocSet = (id, v) => { const cb = $("#" + id); if (cb) cb.checked = !!v; };
+    ocSet("set-oc-turndone", ococ.notifyTurnDone);
+    ocSet("set-oc-awaiting", ococ.notifyAwaiting);
+    ocSet("set-oc-conv", ococ.showConversation);
+    ocSet("set-oc-apiswitch", ococ.apiSwitch);
     m.hidden = false;
   }
   function closeSettings() { const m = $("#settings-modal"); if (m) m.hidden = true; }
@@ -217,6 +290,21 @@
     $$(".set-show").forEach((cb) => cb.addEventListener("change", () => { settings.show[cb.dataset.sec] = cb.checked; saveSettings(); applySettings(); }));
     const rs = $("#set-restore");
     if (rs) rs.addEventListener("change", () => { settings.restoreSessions = rs.checked; saveSettings(); });
+    const ocBind = (id, key) => {
+      const cb = $("#" + id);
+      if (cb) cb.addEventListener("change", () => {
+        settings.opencode = settings.opencode || {};
+        settings.opencode[key] = cb.checked;
+        saveSettings();
+        // re-render so the apiSwitch toggle hides/shows the controls immediately
+        const s = activeSession();
+        if (s && s.agent === "opencode") renderQuickControls(s).catch(() => {});
+      });
+    };
+    ocBind("set-oc-turndone", "notifyTurnDone");
+    ocBind("set-oc-awaiting", "notifyAwaiting");
+    ocBind("set-oc-conv", "showConversation");
+    ocBind("set-oc-apiswitch", "apiSwitch");
     const close = $("#set-close"), save = $("#set-save"), reset = $("#set-reset"), modal = $("#settings-modal");
     if (close) close.addEventListener("click", closeSettings);
     if (save) save.addEventListener("click", closeSettings);
@@ -384,7 +472,9 @@
       const unCMsg = await listen(`conv-msg:${ptyId}`, (e) => onConvMsg(session, e.payload));
       const unCTool = await listen(`conv-tool:${ptyId}`, (e) => onConvTool(session, e.payload));
       const unCReset = await listen(`conv-reset:${ptyId}`, () => { session.transcript = []; if (session.convView) renderConv(session); });
-      session.unlisten.push(unData, unExit, unProg, unCMsg, unCTool, unCReset);
+      // opencode turn-complete edge (fires even when this tab is active).
+      const unTurn = await listen(`agent-turn-done:${ptyId}`, (e) => onTurnDone(session, e.payload));
+      session.unlisten.push(unData, unExit, unProg, unCMsg, unCTool, unCReset, unTurn);
     } catch (err) {
       session.status = "error";
       if (session.term) session.term.write(`\r\n\x1b[31m[pty 오류: ${err}]\x1b[0m\r\n`);
@@ -451,8 +541,9 @@
     if (!slot) return;
     const atBottom = slot.scrollHeight - slot.scrollTop - slot.clientHeight < 80;
     slot.innerHTML = "";
-    if (session.agent === "opencode") {
-      slot.appendChild(el("div", "conv-degraded-note", "opencode는 대화 내용을 디스크에 노출하지 않습니다 — 활동 로그만 표시"));
+    if (session.agent === "opencode" && settings.opencode && settings.opencode.showConversation === false) {
+      slot.appendChild(el("div", "conv-degraded-note", "opencode 대화 표시가 설정에서 꺼져 있습니다"));
+      return;
     }
     if (!session.transcript.length) {
       slot.appendChild(el("div", "conv-empty", "대화 기록이 여기에 표시됩니다"));
@@ -479,6 +570,15 @@
       }
     }
     if (session.convSlot && session.convView) renderConv(session);
+  }
+  /* opencode turn complete (backend edge-trigger). Fires regardless of which tab
+     is focused — the user explicitly asked to be notified when a turn finishes. */
+  function onTurnDone(session, payload) {
+    if (!session) return;
+    if (settings.opencode && settings.opencode.notifyTurnDone === false) return;
+    const mode = (payload && (payload.title || payload.model)) || session.agentLabel || "opencode";
+    pushNotification({ title: session.title, body: mode + " — 턴 완료" });
+    if (store.activeId !== session.id) markAttention(session);
   }
 
   function showSession(id) {
@@ -525,7 +625,7 @@
     if (agentLbl) agentLbl.textContent = session.agentLabel || session.shell || "셸";
     const agentDot = $("#cx-agent-dot");
     if (agentDot) agentDot.style.background = ACCENT_HEX[session.accent] || ACCENT_HEX.green;
-    renderQuickControls(session);
+    renderQuickControls(session).catch(() => {});
     renderComposerCtx(session);
 
     requestAnimationFrame(() => {
@@ -571,8 +671,17 @@
     // launch the agent CLI inside the freshly-started shell
     if (agent.launch && session.ptyId != null) {
       const resuming = !!(opts.resume && agent.resume);
-      const cmd = resuming ? (agent.launch + " " + agent.resume) : agent.launch;
-      setTimeout(() => { if (session.ptyId != null) invoke("pty_write", { id: session.ptyId, data: cmd + "\r" }); }, 350);
+      let cmd = resuming ? (agent.launch + " " + agent.resume) : agent.launch;
+      // opencode: Helm owns the HTTP API port so it can drive model/agent
+      // switching. Allocate a free port and have the bare TUI serve the API on it.
+      if (agentKey === "opencode") {
+        try {
+          const port = await invoke("opencode_alloc_port", { ptyId: session.ptyId });
+          if (port) { session._ocPort = port; cmd += " --port " + port + " --hostname 127.0.0.1"; }
+        } catch (_) {}
+      }
+      const launchCmd = cmd;
+      setTimeout(() => { if (session.ptyId != null) invoke("pty_write", { id: session.ptyId, data: launchCmd + "\r" }); }, 350);
       pushTimeline(session, agent.label + (resuming ? " 이어서" : " 실행"), agent.accent);
     }
 
@@ -682,6 +791,11 @@
     if (p.activity != null) prog.activity = p.activity;
     if (Array.isArray(p.todos)) prog.todos = p.todos;
     if (p.context) prog.context = p.context;
+    // opencode mode/model/provider/sid (DB-sourced) — drives the chip + switch API
+    if (p.mode != null && p.mode !== "") session.currentMode = p.mode;
+    if (p.model != null && p.model !== "") session.currentModel = p.model;
+    if (p.provider != null && p.provider !== "") session.currentProvider = p.provider;
+    if (p.sid) session.ocSessionId = p.sid;
     if (Array.isArray(p.tools) && p.tools.length) {
       const seen = session._toolKeys || (session._toolKeys = new Set());
       session.toolStats = session.toolStats || {};
@@ -703,9 +817,14 @@
       });
     }
     prog.updatedAt = Date.now();
-    if (p.status === "waiting") markAttention(session);
+    if (p.status === "waiting" && (!settings.opencode || session.agent !== "opencode" || settings.opencode.notifyAwaiting !== false)) markAttention(session);
     App.renderLeft();
-    if (store.activeId === session.id) { App.renderRight(); renderComposerCtx(session); renderFileChips(session); }
+    if (store.activeId === session.id) {
+      App.renderRight();
+      renderComposerCtx(session);
+      renderFileChips(session);
+      if (session.agent === "opencode") renderQuickControls(session).catch(() => {});
+    }
     if (store.view === "todos") renderTodosView();
   }
 
@@ -788,7 +907,11 @@
     const menu = el("div", "cx-quick-menu");
     items.forEach((it) => {
       const mi = el("button", "cx-quick-mi", it.label);
-      mi.addEventListener("click", () => { menu.remove(); sendCmd(it.cmd); });
+      mi.addEventListener("click", () => {
+        menu.remove();
+        if (it.action) it.action();      // real switch (opencode API)
+        else if (it.cmd) sendCmd(it.cmd); // slash command (claude/codex)
+      });
       menu.appendChild(mi);
     });
     document.body.appendChild(menu);
@@ -798,21 +921,43 @@
     const close = (e) => { if (!menu.contains(e.target) && e.target !== anchor) { menu.remove(); document.removeEventListener("mousedown", close); } };
     setTimeout(() => document.addEventListener("mousedown", close), 0);
   }
-  function renderQuickControls(session) {
+  async function renderQuickControls(session) {
     const wrap = $("#cx-quick");
     if (!wrap) return;
+    // opencode builds its controls from the live HTTP API (async); everyone else
+    // uses the static slash-command map.
+    let cmds;
+    if (session && session.agent === "opencode") {
+      try { cmds = await buildOpencodeControls(session); } catch (_) { cmds = []; }
+      // a later render may already have replaced this content — guard against it
+      if (!wrap.isConnected) return;
+    } else {
+      cmds = (session && AGENT_CMDS[session.agent]) || [];
+    }
     wrap.innerHTML = "";
-    const cmds = (session && AGENT_CMDS[session.agent]) || [];
-    cmds.forEach((c) => {
+    (cmds || []).forEach((c) => {
       const b = el("button", "cx-quick-btn", c.menu ? (c.label + " ▾") : c.label);
       if (c.menu) {
         b.addEventListener("click", (e) => { e.stopPropagation(); openQuickMenu(b, c.menu); });
+      } else if (c.action) {
+        b.addEventListener("click", (e) => { e.stopPropagation(); c.action(); });
       } else {
         b.title = c.cmd + " 보내기";
         b.addEventListener("click", () => sendCmd(c.cmd));
       }
       wrap.appendChild(b);
     });
+    // current mode + model chip (opencode only)
+    if (session && session.agent === "opencode" && (session.currentMode || session.currentModel)) {
+      const chip = el("span", "cx-mode-chip");
+      if (session.currentMode) chip.appendChild(el("span", "cx-mode-chip-mode", session.currentMode));
+      if (session.currentModel) {
+        if (session.currentMode) chip.appendChild(el("span", "cx-mode-chip-sep", "·"));
+        chip.appendChild(el("span", "cx-mode-chip-model", session.currentModel));
+      }
+      if (session.ocPendingModel || session.ocPendingAgent) chip.appendChild(el("span", "cx-mode-chip-pending", "● 대기"));
+      wrap.appendChild(chip);
+    }
   }
 
   function renderComposerCtx(s) {
@@ -991,6 +1136,16 @@
     } else {
       ["rr-sess-agent", "rr-sess-cwd", "rr-sess-branch", "rr-sess-uptime"].forEach((id) => setTxt(id, "—"));
       const stEl = $("#rr-sess-status"); if (stEl) { stEl.textContent = "—"; stEl.className = "rr-info-val"; }
+    }
+
+    // opencode mode/model row (hidden for other agents)
+    const modeRow = $("#rr-sess-mode-row");
+    if (modeRow) {
+      const showMode = s && s.agent === "opencode" && (s.currentMode || s.currentModel);
+      modeRow.hidden = !showMode;
+      if (showMode) {
+        setTxt("rr-sess-mode", (s.currentMode || "—") + (s.currentModel ? " · " + s.currentModel : ""));
+      }
     }
 
     // agent progress: status pill + activity
@@ -1190,6 +1345,18 @@
       meta.appendChild(el("span", "tv-meta-folder", "📁 " + projectName(s.cwd)));
       if (s.branch) { meta.appendChild(el("span", "tv-meta-sep", "·")); meta.appendChild(el("span", "tv-meta-branch", s.branch)); }
       card.appendChild(meta);
+
+      // opencode mode (e.g. "Sisyphus - Ultraworker") + model chip
+      if (s.agent === "opencode" && (s.currentMode || s.currentModel)) {
+        const mr = el("div", "tv-mode");
+        mr.appendChild(el("span", "tv-mode-label", "모드"));
+        mr.appendChild(el("span", "tv-mode-val", s.currentMode || "—"));
+        if (s.currentModel) {
+          mr.appendChild(el("span", "tv-mode-sep", "·"));
+          mr.appendChild(el("span", "tv-mode-model", s.currentModel));
+        }
+        card.appendChild(mr);
+      }
 
       const act = (prog.activity || "").trim();
       if (act) {
@@ -1427,12 +1594,47 @@
     if (cb) cb.addEventListener("change", () => { _activeOnly = cb.checked; renderLeft(); });
   }
 
-  function composerSend() {
+  async function composerSend() {
     const input = $("#cx-input");
     const s = activeSession();
     if (!input || !s || s.ptyId == null) return;
     const text = input.value;
     if (!text.length) return;
+
+    // opencode real switch: when a model/agent is pending AND we have an API port
+    // + bound session id, send through opencode_send so the selection is applied
+    // and persisted on this turn. Falls back to the PTY on any failure.
+    const ocSwitching = s.agent === "opencode"
+      && (s.ocPendingModel || s.ocPendingAgent)
+      && s._ocPort && s.ocSessionId
+      && !(settings.opencode && settings.opencode.apiSwitch === false);
+    if (ocSwitching) {
+      let ok = false;
+      try {
+        ok = await invoke("opencode_send", {
+          port: s._ocPort,
+          sessionId: s.ocSessionId,
+          text,
+          modelId: s.ocPendingModel || null,
+          provider: s.ocPendingProvider || null,
+          agent: s.ocPendingAgent || null,
+        });
+      } catch (_) { ok = false; }
+      if (ok) {
+        if (s.ocPendingModel) s.currentModel = s.ocPendingModel;
+        if (s.ocPendingAgent) s.currentMode = (s.ocPendingAgent || "").replace(/^​/, "");
+        s.ocPendingModel = null; s.ocPendingAgent = null; s.ocPendingProvider = null;
+        s.msgCount = (s.msgCount || 0) + 1;
+        const msgN2 = $("#cx-msg-n"); if (msgN2) msgN2.textContent = String(s.msgCount);
+        pushTimeline(s, "메시지 전송 (모델/에이전트 전환 적용)", "purple");
+        input.value = ""; input.style.height = "";
+        renderQuickControls(s).catch(() => {});
+        return;
+      }
+      // fall through to PTY send + native picker if the API switch failed
+      pushTimeline(s, "API 전환 실패 — 터미널로 전송", "orange");
+    }
+
     invoke("pty_write", { id: s.ptyId, data: text + "\r" });
     s.msgCount = (s.msgCount || 0) + 1;
     const msgN = $("#cx-msg-n");

@@ -4,6 +4,33 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.6.0] — 2026-06-24
+
+Deep opencode integration — Helm now reads opencode's own SQLite store and talks
+to its HTTP API, so opencode sessions are first-class like Claude and Codex.
+
+### Added
+
+- **opencode conversation, tasks & context** — Helm reads opencode's `opencode.db`
+  (read-only) and reconstructs the full conversation (text, reasoning, tool calls),
+  the task list, and live token context. The old "no message bodies on disk" gap is
+  gone — opencode now shows real conversation cards.
+- **Current mode/model display** — the active opencode agent mode (e.g.
+  `Sisyphus - Ultraworker`) and model show as a chip in the composer, a row on the
+  tasks-board card, and a line in the right rail.
+- **Real model / agent switching** — Helm launches opencode with its own HTTP API
+  port and drives switching through that API (`/session/{id}/message` carrying the
+  chosen model + agent, plus a button for opencode's native model picker). The
+  model and agent buttons list the live options from the running opencode, replacing
+  the old slash-command injection.
+- **Turn notifications** — a toast fires when an opencode turn completes, and the
+  session flags attention when it's awaiting prompt input. Both are toggleable.
+
+### Changed
+
+- New opencode settings: conversation rendering, turn-done / awaiting-input
+  notifications, and API switching can each be turned on or off.
+
 ## [0.5.0] — 2026-06-24
 
 ### Added
@@ -163,6 +190,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.6.0]: https://github.com/kalhintz/Helm/releases/tag/v0.6.0
 [0.5.0]: https://github.com/kalhintz/Helm/releases/tag/v0.5.0
 [0.4.1]: https://github.com/kalhintz/Helm/releases/tag/v0.4.1
 [0.4.0]: https://github.com/kalhintz/Helm/releases/tag/v0.4.0
