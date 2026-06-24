@@ -13,7 +13,29 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime};
+
+use notify::{RecursiveMode, Watcher};
+
+/// Filesystem-change signal for a directory tree. The watch loops block on the
+/// returned receiver so they react the instant an agent writes its log, instead
+/// of waking on a fixed poll. The returned watcher must be kept alive (dropping
+/// it stops the watch); a periodic recv_timeout still serves as a safety net.
+fn dir_signal(dir: &Path) -> (Option<notify::RecommendedWatcher>, Receiver<()>) {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            let _ = tx.send(());
+        }
+    })
+    .ok()
+    .and_then(|mut w| match w.watch(dir, RecursiveMode::Recursive) {
+        Ok(_) => Some(w),
+        Err(_) => None,
+    });
+    (watcher, rx)
+}
 
 use serde::Serialize;
 use serde_json::Value;
@@ -267,7 +289,7 @@ fn newest_jsonl(dir: &Path, after: SystemTime) -> Option<PathBuf> {
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(m) = meta.modified() else { continue };
         // skip files that went stale before we started (allow 5s skew)
-        if m + Duration::from_secs(5) < after {
+        if m + Duration::from_secs(86_400) < after {
             continue;
         }
         if best.as_ref().map_or(true, |(bm, _)| m > *bm) {
@@ -288,9 +310,11 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let mut state = ClaudeState::default();
     let mut last_sig = String::new();
     let mut pending: HashMap<String, String> = HashMap::new();
+    let (_fs_watch, fs_rx) = dir_signal(&home.join(".claude").join("projects"));
 
     loop {
-        std::thread::sleep(Duration::from_millis(700));
+        // wake the instant claude writes its transcript; 1.2s is just a safety net
+        let _ = fs_rx.recv_timeout(Duration::from_millis(1200));
         if !dir.exists() {
             continue;
         }
@@ -668,7 +692,7 @@ fn newest_codex_rollout(root: &Path, after: SystemTime, cwd: &str) -> Option<Pat
         .into_iter()
         .filter_map(|p| {
             let m = std::fs::metadata(&p).and_then(|md| md.modified()).ok()?;
-            if m + Duration::from_secs(5) < after {
+            if m + Duration::from_secs(86_400) < after {
                 None
             } else {
                 Some((m, p))
@@ -806,9 +830,10 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let mut state = CodexState::default();
     let mut last_sig = String::new();
     let mut pending: HashMap<String, String> = HashMap::new();
+    let (_fs_watch, fs_rx) = dir_signal(&root);
 
     loop {
-        std::thread::sleep(Duration::from_millis(800));
+        let _ = fs_rx.recv_timeout(Duration::from_millis(1200));
         if !root.exists() {
             continue;
         }
@@ -1120,9 +1145,10 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let mut idle_polls: u32 = 0;
     let mut last_activity = String::new();
     let mut conv_seq: u64 = 0;
+    let (_fs_watch, fs_rx) = dir_signal(&root);
 
     loop {
-        std::thread::sleep(Duration::from_millis(700));
+        let _ = fs_rx.recv_timeout(Duration::from_millis(1200));
 
         if sid.is_empty() {
             sid = resolve_opencode_sid(&root, &cwd).unwrap_or_default();
