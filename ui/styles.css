@@ -563,7 +563,9 @@ body {
 .rr-ctx-nums { font-family: var(--mono-font); color: var(--text-dim); }
 
 .rr-todo-score { float: right; font-family: var(--mono-font); font-size: 10px; color: var(--muted); }
-.rr-todo-list { display: flex; flex-direction: column; gap: 1px; }
+.rr-todo-list { display: flex; flex-direction: column; gap: 1px; max-height: 240px; overflow-y: auto; }
+.rr-todo-list::-webkit-scrollbar { width: 7px; }
+.rr-todo-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 .rr-todo-item { display: flex; align-items: baseline; gap: 6px; font-size: 11px; color: var(--text-dim); padding: 3px 4px; border-radius: 5px; line-height: 1.35; }
 .rr-todo-item:hover { background: rgba(230,237,243,0.04); }
 .rr-todo-check { flex-shrink: 0; width: 12px; text-align: center; font-size: 10px; color: var(--muted-2); }

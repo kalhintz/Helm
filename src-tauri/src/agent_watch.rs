@@ -299,6 +299,37 @@ fn newest_jsonl(dir: &Path, after: SystemTime) -> Option<PathBuf> {
     best.map(|(_, p)| p)
 }
 
+/// Read Claude's token context from OMC's per-project HUD cache
+/// (`<cwd>/.omc/state/hud-stdin-cache.json`). OMC already computes the exact
+/// usage, so when it's present this is far more reliable than parsing the
+/// transcript (which can live under an unexpected slug).
+fn read_omc_context(cwd: &str) -> Option<Context> {
+    let path = Path::new(cwd)
+        .join(".omc")
+        .join("state")
+        .join("hud-stdin-cache.json");
+    let txt = std::fs::read_to_string(&path).ok()?;
+    let v: Value = serde_json::from_str(txt.trim_start_matches('\u{feff}')).ok()?;
+    let cw = &v["context_window"];
+    let max = cw["context_window_size"].as_u64().unwrap_or(0);
+    if max == 0 {
+        return None;
+    }
+    let cu = &cw["current_usage"];
+    let used = cu["input_tokens"].as_u64().unwrap_or(0)
+        + cu["output_tokens"].as_u64().unwrap_or(0)
+        + cu["cache_creation_input_tokens"].as_u64().unwrap_or(0)
+        + cu["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let pct = cw["used_percentage"]
+        .as_u64()
+        .map(|p| p.min(100) as u8)
+        .unwrap_or_else(|| ((used as f64 / max as f64) * 100.0).min(100.0) as u8);
+    if used == 0 && pct == 0 {
+        return None;
+    }
+    Some(Context { used, max, pct })
+}
+
 fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let Some(home) = home_dir() else { return };
     let dir = home.join(".claude").join("projects").join(slug_for_cwd(&cwd));
@@ -374,8 +405,19 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
             .map(|d| d.as_secs() >= 3)
             .unwrap_or(true);
 
-        let prog = state.to_progress(idle);
-        let sig = state.signature(&prog);
+        let mut prog = state.to_progress(idle);
+        // OMC writes an exact HUD cache (model/context/cost) per project — read it
+        // for token context. Reliable regardless of which slug Claude wrote to and
+        // needs no hook approval, so context tracks even before hooks fire.
+        let omc_ctx = read_omc_context(&cwd);
+        if omc_ctx.is_some() {
+            prog.context = omc_ctx.clone();
+        }
+        let sig = format!(
+            "{}|{}",
+            state.signature(&prog),
+            omc_ctx.as_ref().map(|c| c.pct).unwrap_or(255)
+        );
         if sig != last_sig {
             last_sig = sig;
             // Once native hooks are live for this pty they own status/activity/todos;
