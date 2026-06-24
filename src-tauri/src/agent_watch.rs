@@ -363,11 +363,36 @@ struct ClaudeState {
     last_tool_summary: String,
     last_stop: String,
     used_tokens: u64,
+    // OMC-style task harness (TaskCreate/TaskUpdate) — an alternative to TodoWrite.
+    // The id is only known from the TaskCreate tool_result ("Task #<id> created"),
+    // so we hold the subject by tool_use_id until that result arrives.
+    omc_pending: HashMap<String, String>,
+    omc_tasks: Vec<(String, String, String)>, // (id, text, status)
 }
 
 impl ClaudeState {
     fn ingest(&mut self, v: &Value) {
-        if v["type"].as_str() != Some("assistant") {
+        let typ = v["type"].as_str().unwrap_or("");
+        if typ == "user" {
+            // A TaskCreate's assigned id only appears in its tool_result
+            // ("Task #<id> created…"), so resolve pending subjects here.
+            if let Some(arr) = v["message"]["content"].as_array() {
+                for item in arr {
+                    if item["type"].as_str() != Some("tool_result") {
+                        continue;
+                    }
+                    let tuid = item["tool_use_id"].as_str().unwrap_or("");
+                    if let Some(subject) = self.omc_pending.get(tuid).cloned() {
+                        if let Some(id) = parse_task_id(&tool_result_text(&item["content"])) {
+                            self.omc_pending.remove(tuid);
+                            self.omc_tasks.push((id, subject, "pending".into()));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if typ != "assistant" {
             return;
         }
         let msg = &v["message"];
@@ -416,6 +441,40 @@ impl ClaudeState {
                                         status: t["status"].as_str().unwrap_or("pending").to_string(),
                                     })
                                     .collect();
+                            }
+                        } else if name == "TaskCreate" {
+                            let subject = item["input"]["subject"]
+                                .as_str()
+                                .or_else(|| item["input"]["activeForm"].as_str())
+                                .or_else(|| item["input"]["description"].as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(tuid) = item["id"].as_str() {
+                                if !subject.is_empty() {
+                                    self.omc_pending.insert(tuid.to_string(), subject);
+                                }
+                            }
+                        } else if name == "TaskUpdate" {
+                            let id = item["input"]["taskId"]
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| item["input"]["taskId"].as_u64().map(|n| n.to_string()));
+                            if let Some(id) = id {
+                                let status = item["input"]["status"].as_str().unwrap_or("");
+                                if status == "deleted" {
+                                    self.omc_tasks.retain(|(tid, _, _)| tid != &id);
+                                } else {
+                                    for t in self.omc_tasks.iter_mut() {
+                                        if t.0 == id {
+                                            if !status.is_empty() {
+                                                t.2 = status.to_string();
+                                            }
+                                            if let Some(subj) = item["input"]["subject"].as_str() {
+                                                t.1 = subj.to_string();
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         let summary = summarize_input(&item["input"]);
@@ -467,11 +526,20 @@ impl ClaudeState {
         };
 
         let tools = self.tools.iter().rev().take(20).rev().cloned().collect();
+        // Prefer the OMC task harness when present, otherwise the TodoWrite list.
+        let todos = if !self.omc_tasks.is_empty() {
+            self.omc_tasks
+                .iter()
+                .map(|(_, text, status)| TodoItem { text: text.clone(), status: status.clone() })
+                .collect()
+        } else {
+            self.todos.clone()
+        };
 
         AgentProgress {
             status: status.into(),
             activity,
-            todos: self.todos.clone(),
+            todos,
             tools,
             context,
         }
@@ -480,16 +548,32 @@ impl ClaudeState {
     fn signature(&self, p: &AgentProgress) -> String {
         let done = p.todos.iter().filter(|t| t.status == "completed").count();
         let last_ts = self.tools.last().map(|t| t.ts.as_str()).unwrap_or("");
+        let todo_sig: String = p.todos.iter().map(|t| t.status.chars().next().unwrap_or('?')).collect();
         format!(
-            "{}|{}|{}/{}|{}|{}|{}",
+            "{}|{}|{}/{}|{}|{}|{}|{}",
             p.status,
             p.activity,
             done,
             p.todos.len(),
             self.tools.len(),
             last_ts,
-            self.used_tokens
+            self.used_tokens,
+            todo_sig
         )
+    }
+}
+
+/// Pull the numeric id out of a TaskCreate result like "Task #26 created…".
+fn parse_task_id(text: &str) -> Option<String> {
+    let idx = text.find("Task #")?;
+    let digits: String = text[idx + "Task #".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
     }
 }
 
