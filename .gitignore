@@ -1,0 +1,23 @@
+# Rust / Tauri build output
+/src-tauri/target/
+# Tauri auto-generated (schemas, etc.) — regenerated on build
+/src-tauri/gen/
+
+# Tooling state — contains local paths, session names, cost/usage data. Never commit.
+.omc/
+**/.omc/
+
+# Node
+node_modules/
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+*.log
+*.tmp
+
+# Local dev aids — kept on disk, not published to the repo
+/knowledge/
+/scripts/
+/.githooks/
+/CLAUDE.md

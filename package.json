@@ -1,0 +1,15 @@
+{
+  "name": "helm",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Helm — native Windows dashboard terminal that harmonizes with AI coding agent CLIs (Tauri + WebView2 + ConPTY)",
+  "license": "MIT",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

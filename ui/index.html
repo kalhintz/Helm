@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Helm</title>
+    <link rel="stylesheet" href="vendor/xterm/xterm.css" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- ========================= TOP BAR (48px, draggable) ========================= -->
+    <header id="topbar" data-tauri-drag-region>
+      <div class="tb-left" data-tauri-drag-region>
+        <div class="brand-chip" title="Helm">&#9096;</div>
+        <span class="tb-brand">Helm</span>
+        <nav class="tb-nav" id="tb-nav">
+          <button class="tb-tab active" data-view="dashboard">세션</button>
+          <button class="tb-tab" data-view="todos">작업</button>
+        </nav>
+      </div>
+
+      <div class="tb-spacer" data-tauri-drag-region></div>
+
+      <div class="tb-right">
+        <button class="tb-icon" id="tb-bell" title="알림" aria-haspopup="true" aria-expanded="false">
+          <span class="i-bell">&#9788;</span>
+          <span class="tb-unread" id="tb-unread" hidden></span>
+        </button>
+        <button class="tb-icon" id="tb-gear" title="설정">&#9881;</button>
+
+        <div class="conn-pill" id="conn-pill" data-state="connecting">
+          <span class="conn-dot"></span><span class="conn-label">Connecting</span>
+        </div>
+
+        <div class="wc-group">
+          <button class="wc-btn" id="wc-min" title="Minimize">&#8722;</button>
+          <button class="wc-btn" id="wc-max" title="Maximize">&#9744;</button>
+          <button class="wc-btn wc-close" id="wc-close" title="Close">&#10005;</button>
+        </div>
+      </div>
+
+      <!-- bell dropdown -->
+      <div class="tb-dropdown" id="bell-dropdown" hidden>
+        <div class="dd-head">알림</div>
+        <div class="dd-body" id="bell-list">
+          <div class="dd-empty">에이전트 승인 및 알림이 여기에 표시됩니다.</div>
+        </div>
+      </div>
+    </header>
+
+    <!-- ========================= PAGE HEADER ROW ========================= -->
+    <div id="page-header">
+      <div class="ph-left">
+        <button class="ph-back" id="ph-back" title="뒤로">&#8592;</button>
+        <h1 class="ph-title" id="ph-title">진행 상황</h1>
+      </div>
+      <div class="ph-chips" id="ph-chips">
+        <span class="chip chip-active" id="chip-active"><span class="chip-dot dot-orange"></span>활성 <b id="chip-active-n">0</b></span>
+        <span class="chip" id="chip-loaded">로드된 세션 <b id="chip-loaded-n">0</b></span>
+        <span class="chip chip-muted" id="chip-projects" title="프로젝트별 세션 수"></span>
+        <span class="chip" id="chip-conn"><span class="chip-dot dot-green"></span>Connected</span>
+      </div>
+    </div>
+
+    <!-- ========================= APP SHELL: 3 COLUMNS ========================= -->
+    <main id="app-shell">
+      <!-- ===================== LEFT RAIL ===================== -->
+      <aside id="left-rail" class="rail" aria-label="세션 목록">
+        <div class="lr-new-btn-wrap">
+          <button class="lr-new-btn" id="lr-new-session">
+            <span class="lr-plus">+</span> 새 세션
+          </button>
+        </div>
+
+        <div class="lr-filter-bar">
+          <div class="lr-seg-tabs" role="tablist">
+            <button class="lr-seg active" data-seg="project" role="tab">프로젝트</button>
+            <button class="lr-seg" data-seg="session" role="tab">세션</button>
+          </div>
+          <label class="lr-toggle-wrap" title="활성 세션만 표시">
+            <input type="checkbox" id="lr-active-only" class="lr-toggle-input" />
+            <span class="lr-toggle-track"><span class="lr-toggle-thumb"></span></span>
+            <span class="lr-toggle-label">활성만</span>
+          </label>
+        </div>
+
+        <div class="lr-list" id="lr-session-list" role="listbox" aria-label="세션 목록"></div>
+      </aside>
+
+      <!-- ===================== CENTER ===================== -->
+      <section id="center" class="center" aria-label="활성 세션">
+        <div id="cx-tabs" role="tablist" aria-label="세션 탭"></div>
+        <div id="cx-header">
+          <div id="cx-title-row">
+            <span id="cx-title-text">세션 없음</span>
+            <div id="cx-title-actions">
+              <button class="cx-icon-btn" id="cx-btn-edit" title="제목 수정">&#9998;</button>
+              <button class="cx-icon-btn" id="cx-btn-pin" title="고정">&#9737;</button>
+              <button class="cx-icon-btn cx-danger" id="cx-btn-delete" title="세션 삭제">&#128465;</button>
+              <span id="cx-msg-count" class="cx-msg-count">메시지 <b id="cx-msg-n">0</b></span>
+            </div>
+          </div>
+          <div id="cx-subheader">
+            <span id="cx-view-toggle">
+              <button class="cvt active" data-cv="term">터미널</button>
+              <button class="cvt" data-cv="conv">대화</button>
+            </span>
+            <span id="cx-subheader-label">실시간 ConPTY 터미널</span>
+            <span id="cx-file-chips"></span>
+          </div>
+        </div>
+
+        <div id="cx-term-host">
+          <div id="cx-empty-state">
+            <div class="cx-empty-icon">&#9000;</div>
+            <div class="cx-empty-label">세션을 선택하거나 새 세션을 시작하세요</div>
+            <div class="cx-empty-sub">왼쪽 사이드바에서 + 새 세션을 클릭하세요</div>
+          </div>
+        </div>
+
+        <div id="cx-composer">
+          <div id="cx-composer-top">
+            <div id="cx-agent-chip" title="활성 세션의 에이전트/셸">
+              <span class="cx-agent-dot" id="cx-agent-dot"></span>
+              <span id="cx-agent-label">셸</span>
+            </div>
+            <div id="cx-ctx" hidden>
+              <span class="cx-ctx-label">컨텍스트</span>
+              <span class="cx-ctx-nums" id="cx-ctx-nums">—</span>
+              <div class="cx-ctx-bar"><div class="cx-ctx-fill" id="cx-ctx-fill"></div></div>
+            </div>
+            <span class="cx-send-hint">입력은 활성 터미널로 전송됩니다</span>
+          </div>
+          <div id="cx-textarea-row">
+            <textarea id="cx-input" rows="2" placeholder="후속 메시지 보내기… (⌘Enter로 전송)" spellcheck="false"></textarea>
+            <button id="cx-send-btn" title="전송 (Ctrl+Enter)">⌘↵ 전송</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================== RIGHT RAIL ===================== -->
+      <aside id="right-rail" class="rail" aria-label="세션 상태">
+        <div class="rr-header">
+          <span class="rr-header-title">세션 상태</span>
+        </div>
+
+        <div class="rr-section">
+          <div class="rr-section-label">활성 세션</div>
+          <div class="rr-card" id="rr-card-session">
+            <div class="rr-info-row">
+              <span class="rr-info-key">에이전트</span>
+              <span class="rr-info-val" id="rr-sess-agent">—</span>
+            </div>
+            <div class="rr-info-row">
+              <span class="rr-info-key">상태</span>
+              <span class="rr-info-val" id="rr-sess-status">—</span>
+            </div>
+            <div class="rr-info-row">
+              <span class="rr-info-key">경로</span>
+              <span class="rr-info-val rr-info-mono" id="rr-sess-cwd">—</span>
+            </div>
+            <div class="rr-info-row">
+              <span class="rr-info-key">브랜치</span>
+              <span class="rr-info-val rr-info-mono" id="rr-sess-branch">—</span>
+            </div>
+            <div class="rr-info-row">
+              <span class="rr-info-key">가동</span>
+              <span class="rr-info-val" id="rr-sess-uptime">—</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="rr-section" data-sec="progress">
+          <div class="rr-section-label">진행 <span class="rr-prog-pill" id="rr-prog-status">—</span></div>
+          <div class="rr-prog-activity" id="rr-prog-activity">에이전트 실행 시 진행 상황이 여기에 표시됩니다</div>
+          <div class="rr-ctx" id="rr-ctx-wrap" hidden>
+            <div class="rr-ctx-head"><span>컨텍스트</span><span class="rr-ctx-nums" id="rr-ctx-nums">—</span></div>
+            <div class="rr-bar-wrap"><div class="rr-bar rr-bar-blue" id="rr-ctx-bar" style="width:0%"></div></div>
+          </div>
+        </div>
+
+        <div class="rr-section" data-sec="todos">
+          <div class="rr-section-label">작업 <span class="rr-todo-score" id="rr-todo-score"></span></div>
+          <div class="rr-todo-list" id="rr-todo-list"><div class="rr-empty">—</div></div>
+        </div>
+
+        <div class="rr-section" data-sec="tools">
+          <div class="rr-section-label">도구 / 플러그인</div>
+          <div class="rr-tools" id="rr-tools"><div class="rr-empty">—</div></div>
+        </div>
+
+        <div class="rr-section" data-sec="usage">
+          <div class="rr-section-label">USAGE</div>
+
+          <div class="rr-card" id="rr-card-system">
+            <div class="rr-card-head">
+              <span class="rr-acct-label">system</span>
+              <span class="rr-plan-badge">local</span>
+            </div>
+            <div class="rr-usage-row">
+              <span class="rr-usage-key">CPU</span>
+              <div class="rr-bar-wrap"><div class="rr-bar" id="rr-bar-cpu" style="width:0%"></div></div>
+              <span class="rr-usage-val" id="rr-val-cpu">—</span>
+            </div>
+            <div class="rr-usage-row">
+              <span class="rr-usage-key">MEM</span>
+              <div class="rr-bar-wrap"><div class="rr-bar rr-bar-blue" id="rr-bar-mem" style="width:0%"></div></div>
+              <span class="rr-usage-val" id="rr-val-mem">—</span>
+            </div>
+            <div class="rr-usage-row">
+              <span class="rr-usage-key">세션</span>
+              <div class="rr-bar-wrap"><div class="rr-bar rr-bar-purple" id="rr-bar-sess" style="width:0%"></div></div>
+              <span class="rr-usage-val" id="rr-val-sess">—</span>
+            </div>
+          </div>
+
+          <div id="rr-usage-cards"></div>
+
+        </div>
+
+        <div class="rr-section rr-section-last" data-sec="timeline">
+          <div class="rr-section-label">타임라인</div>
+          <div class="rr-timeline" id="rr-timeline"></div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- ========================= 작업 (TASKS) VIEW ========================= -->
+    <div id="todos-view" hidden>
+      <div class="tv-head">작업 <span class="tv-sub">전체 세션</span> <span id="tv-score" class="tv-score"></span></div>
+      <div class="tv-list" id="tv-list"></div>
+    </div>
+
+    <!-- ========================= SETTINGS MODAL ========================= -->
+    <div id="settings-modal" class="modal-overlay" hidden>
+      <div class="modal">
+        <div class="modal-head"><span>설정</span><button class="modal-x" id="set-close" title="닫기">&#10005;</button></div>
+        <div class="modal-body">
+          <div class="set-row">
+            <label for="set-font">터미널 글꼴 크기</label>
+            <input type="range" id="set-font" min="10" max="18" step="0.5" />
+            <span id="set-font-val" class="set-val">—</span>
+          </div>
+          <div class="set-row">
+            <label for="set-cursor">커서 깜빡임</label>
+            <input type="checkbox" id="set-cursor" />
+          </div>
+          <div class="set-row">
+            <label for="set-restore">시작 시 이전 세션 복원</label>
+            <input type="checkbox" id="set-restore" />
+          </div>
+          <div class="set-row">
+            <label for="set-agent">새 세션 기본</label>
+            <select id="set-agent">
+              <option value="ask">매번 묻기</option>
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex</option>
+              <option value="opencode">opencode</option>
+              <option value="pwsh">PowerShell</option>
+              <option value="cmd">Command Prompt</option>
+              <option value="wsl">WSL</option>
+            </select>
+          </div>
+          <div class="set-row">
+            <label for="set-stats">시스템 사용량 갱신</label>
+            <select id="set-stats">
+              <option value="1000">1초</option>
+              <option value="2000">2초</option>
+              <option value="5000">5초</option>
+            </select>
+          </div>
+          <div class="set-group-label">우측 패널 표시</div>
+          <div class="set-checks">
+            <label><input type="checkbox" class="set-show" data-sec="progress" /> 진행</label>
+            <label><input type="checkbox" class="set-show" data-sec="todos" /> 작업</label>
+            <label><input type="checkbox" class="set-show" data-sec="tools" /> 도구/플러그인</label>
+            <label><input type="checkbox" class="set-show" data-sec="usage" /> USAGE</label>
+            <label><input type="checkbox" class="set-show" data-sec="timeline" /> 타임라인</label>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn-ghost" id="set-reset">기본값</button>
+          <button class="btn-primary" id="set-save">완료</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="vendor/xterm/xterm.js"></script>
+    <script src="vendor/xterm/addon-fit.js"></script>
+    <script src="vendor/xterm/addon-web-links.js"></script>
+    <script src="vendor/xterm/addon-webgl.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

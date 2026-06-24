@@ -1,0 +1,1382 @@
+/* =====================================================================
+   cmux dashboard — single cohesive frontend module
+   store + topbar/header + left rail + center terminals + right rail
+   + ConPTY wiring + main()
+   Public store API (single source of truth):
+     App.newSession(opts) -> session
+     App.selectSession(id)
+     App.closeSession(id)
+     App.showSession(id)        (center mount/show)
+     App.renderLeft()
+     App.renderRight()
+   ===================================================================== */
+(function () {
+  "use strict";
+
+  const TAURI = window.__TAURI__ || {};
+  const invoke = (TAURI.core && TAURI.core.invoke)
+    ? TAURI.core.invoke
+    : async () => { throw new Error("no tauri"); };
+  const listen = (TAURI.event && TAURI.event.listen)
+    ? TAURI.event.listen
+    : async () => () => {};
+
+  // Clipboard via the Tauri clipboard-manager plugin — WebView2's built-in
+  // xterm textarea paste is unreliable, so route paste/copy through the plugin.
+  async function clipReadText() {
+    try {
+      const v = await invoke("plugin:clipboard-manager|read_text", { label: null });
+      if (typeof v === "string") return v;
+      return (v && v.plainText && v.plainText.text) || "";
+    } catch (_) { return ""; }
+  }
+  async function clipWriteText(text) {
+    try { await invoke("plugin:clipboard-manager|write_text", { data: { plainText: { label: null, text } } }); } catch (_) {}
+  }
+
+  const $  = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+  const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function fmtUptime(startMs) {
+    let s = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+    const h = Math.floor(s / 3600); s -= h * 3600;
+    const m = Math.floor(s / 60); s -= m * 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+  function fmtClock(ts) {
+    const d = new Date(ts), p = (n) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  function projectName(cwd) {
+    if (!cwd) return "untitled";
+    return String(cwd).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "untitled";
+  }
+
+  const ACCENTS = ["green", "blue", "orange", "purple", "red"];
+  const ACCENT_HEX = { green: "#3fb950", blue: "#4493f8", orange: "#d29922", purple: "#a371f7", red: "#f85149", muted: "#8b949e" };
+
+  /* AI coding agents this multiplexer harmonizes with. Each runs inside a real
+     ConPTY shell; `launch` is the CLI typed into the shell after it starts.
+     The app then surfaces the agent's title (OSC 0/2) and attention requests
+     (OSC 9/777/99) — that is the "harmonized" integration, agent-agnostic. */
+  const AGENTS = {
+    claude:   { label: "Claude Code", shell: "powershell", launch: "claude",   accent: "orange", badge: "claude",   icon: "CC", resume: "--continue" },
+    codex:    { label: "Codex",       shell: "powershell", launch: "codex",     accent: "blue",   badge: "codex",    icon: "CX" },
+    opencode: { label: "opencode",    shell: "powershell", launch: "opencode",  accent: "purple", badge: "opencode", icon: "OC" },
+    pwsh:     { label: "PowerShell",  shell: "powershell", launch: null,        accent: "green",  badge: "pwsh",     icon: "PS" },
+    cmd:      { label: "Command Prompt", shell: "cmd",     launch: null,        accent: "muted",  badge: "cmd",      icon: ">_" },
+    wsl:      { label: "WSL",         shell: "wsl",        launch: null,        accent: "blue",   badge: "wsl",      icon: "WL" },
+  };
+  const agentIcon = (key) => (AGENTS[key] && AGENTS[key].icon) || AGENTS.pwsh.icon;
+  const FILE_TOOLS = new Set(["Edit", "Write", "Read", "NotebookEdit", "MultiEdit", "edit", "read", "write"]);
+  const AGENT_ORDER = ["claude", "codex", "opencode", "pwsh", "cmd", "wsl"];
+  const statusLabel = (st) => ({ spawning: "시작 중", running: "실행 중", active: "실행 중", attention: "입력 대기", idle: "대기", error: "오류", exited: "종료" }[st] || st);
+
+  /* ================================================================
+     XTERM theme
+     ================================================================ */
+  const XTERM_THEME = {
+    background: "#0d0e11", foreground: "#e6edf3", cursor: "#4493f8",
+    cursorAccent: "#0d0e11", selectionBackground: "rgba(68,147,248,0.25)",
+    black: "#161b22", red: "#f85149", green: "#3fb950", yellow: "#d29922",
+    blue: "#4493f8", magenta: "#a371f7", cyan: "#39c5cf", white: "#b1bac4",
+    brightBlack: "#6e7681", brightRed: "#ff7b72", brightGreen: "#56d364",
+    brightYellow: "#e3b341", brightBlue: "#79c0ff", brightMagenta: "#d2a8ff",
+    brightCyan: "#56d8e4", brightWhite: "#f0f6fc",
+  };
+
+  /* ================================================================
+     STORE — single source of truth
+     Session shape:
+       { id, ptyId, title, shell, cwd, status, accent, tags[],
+         startedAt, msgCount, pinned,
+         term, fit, slot, unlisten[], resizeObserver, timeline[], todos[] }
+     status: "spawning" | "running" | "active" | "idle" | "error" | "exited"
+     ================================================================ */
+  const store = {
+    home: "~",
+    connection: "connecting",
+    view: "dashboard",
+    sessions: [],
+    activeId: null,
+    seq: 0,
+    notifications: [],
+    lastCwd: "",
+  };
+
+  /* ================================================================
+     SETTINGS (persisted to localStorage, applied live)
+     ================================================================ */
+  const SETTINGS_KEY = "helm.settings";
+  const DEFAULT_SETTINGS = {
+    fontSize: 12.5, cursorBlink: true, defaultAgent: "ask", statsInterval: 2000,
+    restoreSessions: true,
+    show: { progress: true, todos: true, tools: true, usage: true, timeline: true },
+  };
+  const SESSIONS_KEY = "helm.sessions";
+  function saveSessionState() {
+    try {
+      const sessions = store.sessions.map((s) => ({
+        agent: s.agent, cwd: s.cwd, title: s.title,
+        titleLocked: !!s.titleLocked, pinned: !!s.pinned, convView: !!s.convView,
+      }));
+      const activeIndex = store.sessions.findIndex((s) => s.id === store.activeId);
+      localStorage.setItem(SESSIONS_KEY, JSON.stringify({ sessions, activeIndex }));
+    } catch (_) {}
+  }
+  function loadSessionState() {
+    try { return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "null"); } catch (_) { return null; }
+  }
+  let settings = loadSettings();
+  function loadSettings() {
+    let s;
+    try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); } catch (_) { s = {}; }
+    const merged = Object.assign({}, DEFAULT_SETTINGS, s);
+    merged.show = Object.assign({}, DEFAULT_SETTINGS.show, s.show || {});
+    return merged;
+  }
+  function saveSettings() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch (_) {} }
+  function applySettings() {
+    store.sessions.forEach((s) => {
+      if (s.term) {
+        try {
+          s.term.options.fontSize = settings.fontSize;
+          s.term.options.cursorBlink = settings.cursorBlink;
+          if (s.fit) s.fit.fit();
+        } catch (_) {}
+      }
+    });
+    const sh = settings.show;
+    document.body.classList.toggle("hide-progress", !sh.progress);
+    document.body.classList.toggle("hide-todos", !sh.todos);
+    document.body.classList.toggle("hide-tools", !sh.tools);
+    document.body.classList.toggle("hide-usage", !sh.usage);
+    document.body.classList.toggle("hide-timeline", !sh.timeline);
+    startStatsPolling();
+  }
+  function openSettings() {
+    const m = $("#settings-modal"); if (!m) return;
+    const f = $("#set-font"), fv = $("#set-font-val"), cur = $("#set-cursor"), ag = $("#set-agent"), st = $("#set-stats");
+    if (f) f.value = settings.fontSize;
+    if (fv) fv.textContent = settings.fontSize;
+    if (cur) cur.checked = !!settings.cursorBlink;
+    if (ag) ag.value = settings.defaultAgent;
+    if (st) st.value = String(settings.statsInterval);
+    $$(".set-show").forEach((cb) => { cb.checked = !!settings.show[cb.dataset.sec]; });
+    const rs = $("#set-restore"); if (rs) rs.checked = !!settings.restoreSessions;
+    m.hidden = false;
+  }
+  function closeSettings() { const m = $("#settings-modal"); if (m) m.hidden = true; }
+  function wireSettings() {
+    const f = $("#set-font"), fv = $("#set-font-val"), cur = $("#set-cursor"), ag = $("#set-agent"), st = $("#set-stats");
+    if (f) f.addEventListener("input", () => { settings.fontSize = parseFloat(f.value); if (fv) fv.textContent = f.value; saveSettings(); applySettings(); });
+    if (cur) cur.addEventListener("change", () => { settings.cursorBlink = cur.checked; saveSettings(); applySettings(); });
+    if (ag) ag.addEventListener("change", () => { settings.defaultAgent = ag.value; saveSettings(); });
+    if (st) st.addEventListener("change", () => { settings.statsInterval = parseInt(st.value, 10) || 2000; saveSettings(); applySettings(); });
+    $$(".set-show").forEach((cb) => cb.addEventListener("change", () => { settings.show[cb.dataset.sec] = cb.checked; saveSettings(); applySettings(); }));
+    const rs = $("#set-restore");
+    if (rs) rs.addEventListener("change", () => { settings.restoreSessions = rs.checked; saveSettings(); });
+    const close = $("#set-close"), save = $("#set-save"), reset = $("#set-reset"), modal = $("#settings-modal");
+    if (close) close.addEventListener("click", closeSettings);
+    if (save) save.addEventListener("click", closeSettings);
+    if (reset) reset.addEventListener("click", () => { settings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS)); saveSettings(); applySettings(); openSettings(); });
+    if (modal) modal.addEventListener("click", (e) => { if (e.target === modal) closeSettings(); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSettings(); });
+  }
+
+  function sessionById(id) { return store.sessions.find((s) => s.id === id) || null; }
+  function activeSession() { return sessionById(store.activeId); }
+  function runningCount() { return store.sessions.filter((s) => s.status === "running" || s.status === "active").length; }
+
+  /* ================================================================
+     CENTER — terminal mount/show/hide per session
+     ================================================================ */
+  const termHost   = () => $("#cx-term-host");
+  const emptyState = () => $("#cx-empty-state");
+
+  function mountTerminal(session) {
+    if (session.term) return; // already mounted
+
+    const slot = el("div", "cx-term-slot");
+    slot.dataset.sid = session.id;
+    termHost().appendChild(slot);
+    session.slot = slot;
+
+    const monoFont = getComputedStyle(document.documentElement).getPropertyValue("--mono-font").trim() || "Consolas, monospace";
+    const term = new Terminal({
+      fontFamily: monoFont, fontSize: settings.fontSize, lineHeight: 1.12,
+      cursorBlink: settings.cursorBlink, allowProposedApi: true, theme: XTERM_THEME, scrollback: 20000,
+    });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    try { term.loadAddon(new WebLinksAddon.WebLinksAddon()); } catch (_) {}
+    session.term = term;
+    session.fit = fit;
+
+    // open into slot (must be displayable for sizing)
+    slot.style.display = "block";
+    term.open(slot);
+    // GPU renderer: the DOM renderer repaints on the CPU via rAF and lags echo
+    // on WebView2; WebGL draws glyphs on the GPU so typed chars appear at once.
+    // Disposes on context loss so xterm falls back to the DOM renderer cleanly.
+    try {
+      const webgl = new WebglAddon.WebglAddon();
+      webgl.onContextLoss(() => { try { webgl.dispose(); } catch (_) {} });
+      term.loadAddon(webgl);
+    } catch (_) {}
+    try { fit.fit(); } catch (_) {}
+    slot.style.display = "";
+
+    term.onData((d) => {
+      if (session.ptyId != null) invoke("pty_write", { id: session.ptyId, data: d });
+      // sniff the typed command line so a hand-launched agent re-identifies the session
+      for (const ch of d) {
+        if (ch === "\r" || ch === "\n") {
+          const m = /^\s*(claude|codex|opencode)\b/i.exec(session._line || "");
+          if (m) detectAgent(session, m[1].toLowerCase());
+          session._line = "";
+        } else if (ch === "" || ch === "\b") {
+          session._line = (session._line || "").slice(0, -1);
+        } else if (ch >= " ") {
+          session._line = (session._line || "") + ch;
+        }
+      }
+    });
+    term.onResize(({ cols, rows }) => { if (session.ptyId != null) invoke("pty_resize", { id: session.ptyId, cols, rows }); });
+
+    // Ctrl+V / Cmd+V / Shift+Insert paste; Ctrl+Shift+C / Cmd+C copy on selection.
+    // Ctrl+C is left alone so it still interrupts the agent. term.paste honors
+    // bracketed-paste, so a multi-line path lands as one chunk in TUIs like claude.
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== "keydown") return true;
+      const isV = e.key === "v" || e.key === "V";
+      const isC = e.key === "c" || e.key === "C";
+      if ((e.ctrlKey && isV) || (e.metaKey && isV) || (e.shiftKey && e.key === "Insert")) {
+        clipReadText().then((t) => { if (t) term.paste(t); });
+        return false;
+      }
+      if (((e.ctrlKey && e.shiftKey && isC) || (e.metaKey && isC)) && term.hasSelection()) {
+        clipWriteText(term.getSelection());
+        return false;
+      }
+      return true;
+    });
+
+    // Harmonize with whatever runs inside (claude/codex/opencode/shell):
+    //   OSC 0/2  -> terminal title  -> auto-name the session
+    //   OSC 9/777/99/1337 (bell/notify) -> agent needs attention -> ring + badge
+    try {
+      for (const code of [0, 2]) {
+        term.parser.registerOscHandler(code, (data) => {
+          const t = (data || "").trim();
+          // Accept agent-set titles (claude/codex/opencode emit meaningful strings)
+          // but ignore a plain shell reporting its own exe path / cwd.
+          const looksLikePath = /\.exe\b/i.test(t) || /[\\/]/.test(t) || /^관리자:/.test(t);
+          if (t && !looksLikePath && !session.titleLocked) {
+            session.title = t;
+            App.renderLeft();
+            if (store.activeId === session.id) {
+              const tt = $("#cx-title-text"); if (tt) tt.textContent = t;
+              const ph = $("#ph-title"); if (ph) ph.textContent = t;
+            }
+          }
+          const dk = detectAgentFromText(t);
+          if (dk) detectAgent(session, dk);
+          return false;
+        });
+      }
+      for (const code of [9, 777, 99, 1337]) {
+        term.parser.registerOscHandler(code, () => { markAttention(session); return true; });
+      }
+    } catch (_) {}
+
+    const ro = new ResizeObserver(() => {
+      if (slot.classList.contains("active")) {
+        try { fit.fit(); if (session.ptyId != null) invoke("pty_resize", { id: session.ptyId, cols: term.cols, rows: term.rows }); } catch (_) {}
+      }
+    });
+    ro.observe(slot);
+    session.resizeObserver = ro;
+  }
+
+  async function spawnPty(session) {
+    const cols = (session.term && session.term.cols) || 120;
+    const rows = (session.term && session.term.rows) || 32;
+    try {
+      const ptyId = await invoke("pty_spawn", {
+        shell: session.shell, cwd: session.cwd, cols, rows,
+        workspaceId: session.id, surfaceId: session.id,
+        agent: session.agent,
+      });
+      session.ptyId = ptyId;
+      session.status = "running";
+      pushTimeline(session, "셸 시작됨", "green");
+
+      const unData = await listen(`pty-data:${ptyId}`, (e) => {
+        if (session.term) session.term.write(b64ToBytes(e.payload.b64));
+        session.lastOutput = Date.now();
+      });
+      const unExit = await listen(`pty-exit:${ptyId}`, () => {
+        session.status = "exited";
+        session.ptyId = null;
+        if (session.term) session.term.write("\r\n\x1b[2m[프로세스 종료]\x1b[0m\r\n");
+        pushTimeline(session, "프로세스 종료", "red");
+        App.renderLeft();
+        App.renderRight();
+        App.renderHeaderChips();
+      });
+      const unProg = await listen(`agent-progress:${ptyId}`, (e) => applyProgress(session, e.payload));
+      const unCMsg = await listen(`conv-msg:${ptyId}`, (e) => onConvMsg(session, e.payload));
+      const unCTool = await listen(`conv-tool:${ptyId}`, (e) => onConvTool(session, e.payload));
+      const unCReset = await listen(`conv-reset:${ptyId}`, () => { session.transcript = []; if (session.convView) renderConv(session); });
+      session.unlisten.push(unData, unExit, unProg, unCMsg, unCTool, unCReset);
+    } catch (err) {
+      session.status = "error";
+      if (session.term) session.term.write(`\r\n\x1b[31m[pty 오류: ${err}]\x1b[0m\r\n`);
+      pushTimeline(session, "spawn 실패", "red");
+      console.error("[App] pty_spawn failed", err);
+    }
+  }
+
+  /* ---- conversation view (center "대화" pane, read-only transcript) ---- */
+  function mountConversation(session) {
+    if (session.convSlot) return;
+    const slot = el("div", "cx-conv-slot");
+    slot.dataset.sid = session.id;
+    termHost().appendChild(slot);
+    session.convSlot = slot;
+    renderConv(session);
+  }
+  function convText(s) {
+    const esc = escapeHtml(s || "");
+    return esc
+      .replace(/```(\w*)\n?([\s\S]*?)```/g, (_m, _lang, code) => `<pre class="conv-code">${code.replace(/\n+$/, "")}</pre>`)
+      .replace(/`([^`\n]+)`/g, '<code class="conv-inline">$1</code>')
+      .replace(/\n/g, "<br>");
+  }
+  function buildConvTool(tc) {
+    const row = el("div", "conv-tool is-" + (tc.status || "running"));
+    row.dataset.tid = tc.id || "";
+    row.appendChild(el("span", "conv-tool-name", tc.name || "tool"));
+    if (tc.summary) row.appendChild(el("span", "conv-tool-sum", tc.summary));
+    row.appendChild(el("span", "conv-tool-st", tc.status === "completed" ? "✓" : tc.status === "error" ? "✕" : "…"));
+    if (tc.result) {
+      const d = el("details", "conv-tool-result");
+      d.appendChild(el("summary", null, "결과"));
+      const pre = el("pre", "conv-code"); pre.textContent = tc.result;
+      d.appendChild(pre);
+      row.appendChild(d);
+    }
+    return row;
+  }
+  function buildConvMsg(m) {
+    const art = el("article", "conv-msg conv-role-" + (m.role || "system"));
+    art.dataset.mid = m.id || "";
+    const head = el("div", "conv-head");
+    head.appendChild(el("span", "conv-role-badge", (m.role || "").toUpperCase()));
+    if (m.usage && m.usage.max) head.appendChild(el("span", "conv-usage", fmtTokens(m.usage.used) + " / " + fmtTokens(m.usage.max)));
+    art.appendChild(head);
+    if (m.thinking) {
+      const d = el("details", "conv-thinking");
+      d.appendChild(el("summary", null, "추론"));
+      const body = el("div", "conv-think-body"); body.innerHTML = convText(m.thinking);
+      d.appendChild(body);
+      art.appendChild(d);
+    }
+    if (m.text) { const t = el("div", "conv-text"); t.innerHTML = convText(m.text); art.appendChild(t); }
+    if (m.tool_calls && m.tool_calls.length) {
+      const tools = el("div", "conv-tools");
+      m.tool_calls.forEach((tc) => tools.appendChild(buildConvTool(tc)));
+      art.appendChild(tools);
+    }
+    return art;
+  }
+  function renderConv(session) {
+    const slot = session.convSlot;
+    if (!slot) return;
+    const atBottom = slot.scrollHeight - slot.scrollTop - slot.clientHeight < 80;
+    slot.innerHTML = "";
+    if (session.agent === "opencode") {
+      slot.appendChild(el("div", "conv-degraded-note", "opencode는 대화 내용을 디스크에 노출하지 않습니다 — 활동 로그만 표시"));
+    }
+    if (!session.transcript.length) {
+      slot.appendChild(el("div", "conv-empty", "대화 기록이 여기에 표시됩니다"));
+      return;
+    }
+    session.transcript.forEach((m) => slot.appendChild(buildConvMsg(m)));
+    if (atBottom) slot.scrollTop = slot.scrollHeight;
+  }
+  function onConvMsg(session, m) {
+    if (!m) return;
+    const idx = session.transcript.findIndex((x) => x.id === m.id);
+    if (idx >= 0) session.transcript[idx] = m; else session.transcript.push(m);
+    if (session.transcript.length > 300) session.transcript.shift();
+    session.msgCount = session.transcript.length;
+    if (store.activeId === session.id) { const n = $("#cx-msg-n"); if (n) n.textContent = String(session.msgCount); }
+    if (session.convSlot && session.convView) renderConv(session);
+  }
+  function onConvTool(session, tc) {
+    if (!tc) return;
+    for (const msg of session.transcript) {
+      if (msg.tool_calls) {
+        const t = msg.tool_calls.find((x) => x.id === tc.id);
+        if (t) { t.status = tc.status; t.result = tc.result; if (tc.name && !t.name) t.name = tc.name; break; }
+      }
+    }
+    if (session.convSlot && session.convView) renderConv(session);
+  }
+
+  function showSession(id) {
+    store.sessions.forEach((s) => { if (s.slot) s.slot.classList.remove("active"); if (s.convSlot) s.convSlot.classList.remove("active"); });
+    const session = sessionById(id);
+    const titleText = $("#cx-title-text");
+    const msgN = $("#cx-msg-n");
+    const subLabel = $("#cx-subheader-label");
+    const fileChips = $("#cx-file-chips");
+    const ph = $("#ph-title");
+
+    if (!session) {
+      emptyState().classList.remove("hidden");
+      titleText.textContent = "세션 없음";
+      msgN.textContent = "0";
+      if (ph) ph.textContent = "진행 상황";
+      return;
+    }
+
+    if (session.convView) {
+      mountConversation(session);
+      if (session.convSlot) session.convSlot.classList.add("active");
+      renderConv(session);
+    } else if (session.slot) {
+      session.slot.classList.add("active");
+    }
+    emptyState().classList.add("hidden");
+    const tog = $("#cx-view-toggle");
+    if (tog) tog.querySelectorAll(".cvt").forEach((b) => b.classList.toggle("active", b.dataset.cv === (session.convView ? "conv" : "term")));
+
+    titleText.textContent = session.title;
+    msgN.textContent = String(session.msgCount || 0);
+    if (ph) ph.textContent = session.title;
+
+    subLabel.textContent = session.shell + " · " + projectName(session.cwd);
+    renderFileChips(session);
+
+    // pin button state
+    const pinBtn = $("#cx-btn-pin");
+    if (pinBtn) pinBtn.style.color = session.pinned ? "var(--blue)" : "";
+
+    // composer agent chip reflects the active session's agent
+    const agentLbl = $("#cx-agent-label");
+    if (agentLbl) agentLbl.textContent = session.agentLabel || session.shell || "셸";
+    const agentDot = $("#cx-agent-dot");
+    if (agentDot) agentDot.style.background = ACCENT_HEX[session.accent] || ACCENT_HEX.green;
+    renderComposerCtx(session);
+
+    requestAnimationFrame(() => {
+      try {
+        if (session.fit) session.fit.fit();
+        if (session.ptyId != null && session.term) invoke("pty_resize", { id: session.ptyId, cols: session.term.cols, rows: session.term.rows });
+        if (session.term) session.term.focus();
+      } catch (_) {}
+    });
+  }
+
+  /* ================================================================
+     LIFECYCLE
+     ================================================================ */
+  async function newSession(opts) {
+    opts = opts || {};
+    const agentKey = (opts.agent && AGENTS[opts.agent]) ? opts.agent : "pwsh";
+    const agent = AGENTS[agentKey];
+    const id = "s" + (++store.seq);
+    const cwd = opts.cwd || store.home;
+    const session = {
+      id, ptyId: null,
+      agent: agentKey, agentLabel: agent.label,
+      title: opts.title || (agent.launch ? agent.label : projectName(cwd)),
+      shell: agent.shell, launch: agent.launch,
+      cwd, status: "spawning", accent: agent.accent,
+      tags: opts.tags || (agent.launch ? [agent.label] : []),
+      branch: null,
+      startedAt: Date.now(), msgCount: 0, pinned: false,
+      term: null, fit: null, slot: null, unlisten: [],
+      resizeObserver: null, lastOutput: 0,
+      progress: null, _toolKeys: null, toolStats: {}, _line: "", _watch: null,
+      convSlot: null, convView: false, transcript: [], files: [],
+      timeline: [{ text: "세션 생성됨", color: "blue", time: Date.now(), dur: null }],
+    };
+    store.sessions.push(session);
+    App.renderLeft();
+    App.renderHeaderChips();
+
+    mountTerminal(session);
+    await spawnPty(session);
+
+    // launch the agent CLI inside the freshly-started shell
+    if (agent.launch && session.ptyId != null) {
+      const resuming = !!(opts.resume && agent.resume);
+      const cmd = resuming ? (agent.launch + " " + agent.resume) : agent.launch;
+      setTimeout(() => { if (session.ptyId != null) invoke("pty_write", { id: session.ptyId, data: cmd + "\r" }); }, 350);
+      pushTimeline(session, agent.label + (resuming ? " 이어서" : " 실행"), agent.accent);
+    }
+
+    // resolve git branch for the cwd (real integration)
+    invoke("git_branch", { cwd }).then((b) => {
+      if (b) { session.branch = b; App.renderLeft(); if (store.activeId === session.id) App.renderRight(); }
+    }).catch(() => {});
+
+    App.renderLeft();
+    App.renderRight();
+    App.renderHeaderChips();
+
+    if (store.activeId == null) selectSession(id);
+    return session;
+  }
+
+  function selectSession(id) {
+    const s = sessionById(id);
+    if (!s) return;
+    store.activeId = id;
+    clearAttention(s);
+    App.renderLeft();
+    showSession(id);
+    App.renderRight();
+    App.renderHeaderChips();
+  }
+
+  function closeSession(id) {
+    const idx = store.sessions.findIndex((s) => s.id === id);
+    if (idx < 0) return;
+    const s = store.sessions[idx];
+    s.unlisten.forEach((u) => { try { u(); } catch (_) {} });
+    s.unlisten = [];
+    if (s.ptyId != null) invoke("pty_kill", { id: s.ptyId }).catch(() => {});
+    if (s.resizeObserver) try { s.resizeObserver.disconnect(); } catch (_) {}
+    if (s.term) try { s.term.dispose(); } catch (_) {}
+    if (s.slot) s.slot.remove();
+    if (s.convSlot) s.convSlot.remove();
+
+    store.sessions.splice(idx, 1);
+    if (store.activeId === id) {
+      const next = store.sessions[Math.max(0, idx - 1)];
+      store.activeId = next ? next.id : null;
+    }
+    App.renderLeft();
+    showSession(store.activeId);
+    App.renderRight();
+    App.renderHeaderChips();
+  }
+
+  function renameSession(id, title) {
+    const s = sessionById(id);
+    if (s) { s.title = title; s.titleLocked = true; App.renderLeft(); showSession(store.activeId); App.renderHeaderChips(); }
+  }
+  function togglePin(id) {
+    const s = sessionById(id);
+    if (s) { s.pinned = !s.pinned; App.renderLeft(); showSession(store.activeId); }
+  }
+
+  function pushTimeline(session, text, color, dur) {
+    session.timeline = session.timeline || [];
+    session.timeline.push({ text, color: color || "blue", time: Date.now(), dur: dur || null });
+    if (session.timeline.length > 50) session.timeline.shift();
+    if (store.activeId === session.id) App.renderRight();
+  }
+  function markAttention(session) {
+    if (!session || store.activeId === session.id) return;
+    if (session.status !== "attention") {
+      session.status = "attention";
+      pushTimeline(session, "입력 대기 (주의 필요)", "orange");
+      pushNotification({ title: session.title, body: "에이전트가 입력을 기다립니다" });
+      App.renderLeft();
+      App.renderHeaderChips();
+    }
+  }
+  function clearAttention(session) {
+    if (session && session.status === "attention") {
+      session.status = session.ptyId != null ? "running" : "exited";
+      App.renderLeft();
+      App.renderHeaderChips();
+    }
+  }
+
+  /* ---- agent progress (fed by backend `agent-progress:{ptyId}` events) ---- */
+  const AGENT_ST = {
+    working: ["작업 중", "is-working"], waiting: ["입력 대기", "is-waiting"],
+    done: ["완료", "is-done"], error: ["오류", "is-error"], idle: ["대기", ""],
+  };
+  function fmtTokens(n) {
+    n = n || 0;
+    if (n >= 1000) return (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k";
+    return String(n);
+  }
+  function toolText(t) {
+    const name = t.name || "tool";
+    return t.summary ? `${name} · ${t.summary}` : name;
+  }
+  function applyProgress(session, p) {
+    if (!session || !p) return;
+    const prog = session.progress || (session.progress = { status: "idle", activity: "", todos: [], context: null });
+    if (p.status) prog.status = p.status;
+    if (p.activity != null) prog.activity = p.activity;
+    if (Array.isArray(p.todos)) prog.todos = p.todos;
+    if (p.context) prog.context = p.context;
+    if (Array.isArray(p.tools) && p.tools.length) {
+      const seen = session._toolKeys || (session._toolKeys = new Set());
+      session.toolStats = session.toolStats || {};
+      p.tools.forEach((t) => {
+        const key = (t.ts || "") + "|" + (t.name || "") + "|" + (t.summary || "");
+        if (!seen.has(key)) {
+          seen.add(key);
+          pushTimeline(session, toolText(t), "purple");
+          const nm = t.name || "tool";
+          session.toolStats[nm] = (session.toolStats[nm] || 0) + 1;
+          if (FILE_TOOLS.has(nm)) {
+            const base = (t.summary || "").replace(/\\/g, "/").split("/").pop();
+            if (base && !/\s/.test(base) && base.includes(".")) {
+              session.files = session.files || [];
+              if (!session.files.includes(base)) { session.files.push(base); if (session.files.length > 12) session.files.shift(); }
+            }
+          }
+        }
+      });
+    }
+    prog.updatedAt = Date.now();
+    if (p.status === "waiting") markAttention(session);
+    App.renderLeft();
+    if (store.activeId === session.id) { App.renderRight(); renderComposerCtx(session); renderFileChips(session); }
+    if (store.view === "todos") renderTodosView();
+  }
+
+  /* Re-identify a session by what is actually running inside it (the user may
+     launch claude/codex/opencode by hand in a plain shell). Updates icon /
+     label / accent and starts that agent's progress watcher on the backend. */
+  function detectAgent(session, key) {
+    if (!session || !AGENTS[key] || session.agent === key) return;
+    const a = AGENTS[key];
+    session.agent = key;
+    session.agentLabel = a.label;
+    session.accent = a.accent;
+    if (a.launch) session.launch = a.launch;
+    session.tags = [a.label];
+    if (session.ptyId != null && session._watch !== key) {
+      session._watch = key;
+      invoke("start_agent_watch", { id: session.ptyId, agent: key, cwd: session.cwd }).catch(() => {});
+    }
+    App.renderLeft();
+    if (store.activeId === session.id) { showSession(session.id); App.renderRight(); }
+  }
+  function detectAgentFromText(s) {
+    const t = (s || "").toLowerCase();
+    if (t.includes("opencode")) return "opencode";
+    if (t.includes("claude")) return "claude";
+    if (t.includes("codex")) return "codex";
+    return null;
+  }
+  function renderFileChips(session) {
+    const fileChips = $("#cx-file-chips");
+    if (!fileChips || !session) return;
+    if (session.files && session.files.length) {
+      fileChips.innerHTML = session.files.slice(-6)
+        .map((f, i) => (i ? '<span class="cx-chip-sep">·</span>' : "") + `<a class="cx-file-chip">${escapeHtml(f)}</a>`)
+        .join("");
+    } else {
+      fileChips.innerHTML = `<a class="cx-file-chip">${escapeHtml(session.cwd || "")}</a>`;
+    }
+  }
+  function renderComposerCtx(s) {
+    const wrap = $("#cx-ctx"), nums = $("#cx-ctx-nums"), fill = $("#cx-ctx-fill");
+    if (!wrap) return;
+    const c = s && s.progress && s.progress.context;
+    if (c && c.max) {
+      wrap.hidden = false;
+      const pct = Math.min(100, Math.round((c.used / c.max) * 100));
+      if (nums) nums.textContent = fmtTokens(c.used) + " / " + fmtTokens(c.max) + " · " + pct + "%";
+      if (fill) fill.style.width = pct + "%";
+    } else {
+      wrap.hidden = true;
+    }
+  }
+
+  /* ================================================================
+     LEFT RAIL render
+     ================================================================ */
+  let _activeOnly = false;
+  let _seg = "project";
+
+  function buildRow(s) {
+    const row = el("div", "lr-row" + (s.id === store.activeId ? " selected" : "") + (s.status === "attention" ? " attention" : "") + (s.progress && s.progress.status === "working" ? " agent-working" : ""));
+    row.dataset.id = s.id;
+    row.dataset.status = s.status;
+    row.setAttribute("role", "option");
+    row.addEventListener("click", () => selectSession(s.id));
+
+    const accent = el("div", "lr-row-accent");
+    accent.style.background = ACCENT_HEX[s.accent] || ACCENT_HEX.blue;
+    row.appendChild(accent);
+
+    const main = el("div", "lr-row-main");
+    const top = el("div", "lr-row-top");
+    const dot = el("span", "lr-dot");
+    dot.dataset.status = s.status;
+    top.appendChild(dot);
+    const title = el("span", "lr-title", s.title);
+    title.title = s.title;
+    top.appendChild(title);
+    const uptime = el("span", "lr-uptime", fmtUptime(s.startedAt));
+    uptime.dataset.started = String(s.startedAt);
+    top.appendChild(uptime);
+    main.appendChild(top);
+
+    const bottom = el("div", "lr-row-bottom");
+    bottom.appendChild(el("span", "lr-agent lr-agent-" + (s.agent || "pwsh"), s.agentLabel || s.shell || "셸"));
+    if (s.branch) {
+      const br = el("span", "lr-branch", "⎇ " + s.branch);
+      br.title = s.branch;
+      bottom.appendChild(br);
+    }
+    bottom.appendChild(el("span", "lr-status lr-status-" + s.status, statusLabel(s.status)));
+    (s.tags || []).slice(0, 2).forEach((t) => bottom.appendChild(el("span", "lr-tag", t)));
+    main.appendChild(bottom);
+
+    const act = el("div", "lr-activity");
+    act.dataset.st = (s.progress && s.progress.status) || s.status;
+    main.appendChild(act);
+
+    row.appendChild(main);
+    return row;
+  }
+
+  function renderTabs() {
+    const bar = $("#cx-tabs");
+    if (!bar) return;
+    bar.innerHTML = "";
+    store.sessions.forEach((s) => {
+      const tab = el("div", "cx-tab" + (s.id === store.activeId ? " active" : ""));
+      tab.dataset.id = s.id;
+      tab.title = (s.agentLabel || s.shell || "") + " — " + s.title;
+      tab.appendChild(el("span", "cx-tab-ic ag-" + (s.agent || "pwsh"), agentIcon(s.agent)));
+      tab.appendChild(el("span", "cx-tab-title", s.title));
+      const dot = el("span", "cx-tab-dot");
+      dot.dataset.st = (s.progress && s.progress.status) || s.status;
+      tab.appendChild(dot);
+      const x = el("button", "cx-tab-x", "×");
+      x.title = "닫기";
+      x.addEventListener("click", (e) => { e.stopPropagation(); closeSession(s.id); });
+      tab.appendChild(x);
+      tab.addEventListener("click", () => selectSession(s.id));
+      bar.appendChild(tab);
+    });
+    const add = el("button", "cx-tab-add", "+");
+    add.title = "새 세션";
+    add.addEventListener("click", () => openNew(add));
+    bar.appendChild(add);
+  }
+
+  function renderLeft() {
+    renderTabs();
+    const list = $("#lr-session-list");
+    if (!list) return;
+    const visible = _activeOnly
+      ? store.sessions.filter((s) => s.status === "running" || s.status === "active")
+      : store.sessions;
+    list.innerHTML = "";
+    if (!visible.length) {
+      list.appendChild(el("div", "lr-empty", "세션 없음"));
+      return;
+    }
+    if (_seg === "project") {
+      const groups = {};
+      visible.forEach((s) => { const k = projectName(s.cwd); (groups[k] = groups[k] || []).push(s); });
+      Object.entries(groups).forEach(([name, arr]) => {
+        const h = el("div", "lr-group-label");
+        h.appendChild(el("span", "lr-group-name", name));
+        h.appendChild(el("span", "lr-group-count", String(arr.length)));
+        list.appendChild(h);
+        arr.forEach((s) => list.appendChild(buildRow(s)));
+      });
+    } else {
+      visible.forEach((s) => list.appendChild(buildRow(s)));
+    }
+  }
+
+  /* ================================================================
+     RIGHT RAIL render
+     ================================================================ */
+  function barColorClass(p) { return p >= 80 ? "rr-bar-red" : p >= 50 ? "rr-bar-orange" : "rr-bar-green"; }
+  function valColorClass(p) { return p >= 80 ? "rr-red" : p >= 50 ? "rr-orange" : "rr-green"; }
+
+  function renderSystemCard(stats) {
+    const cpu = Math.min(100, Math.max(0, stats.cpu || 0));
+    const mem = Math.min(100, Math.max(0, stats.mem || 0));
+    const set = (barId, valId, pct, label) => {
+      const bar = $("#" + barId), val = $("#" + valId);
+      if (!bar) return;
+      bar.style.width = pct + "%";
+      val.textContent = label != null ? label : pct.toFixed(0) + "%";
+    };
+    const barCpu = $("#rr-bar-cpu"), valCpu = $("#rr-val-cpu");
+    if (barCpu) {
+      barCpu.style.width = cpu + "%";
+      barCpu.className = "rr-bar " + barColorClass(cpu);
+      valCpu.textContent = cpu.toFixed(0) + "%";
+      valCpu.className = "rr-usage-val " + valColorClass(cpu);
+    }
+    const barMem = $("#rr-bar-mem"), valMem = $("#rr-val-mem");
+    if (barMem) {
+      barMem.style.width = mem + "%";
+      barMem.className = "rr-bar " + barColorClass(mem);
+      valMem.textContent = mem.toFixed(0) + "%";
+      valMem.className = "rr-usage-val " + valColorClass(mem);
+    }
+    // session uptime (active session), capped to 4h for the bar
+    const s = activeSession();
+    const barSess = $("#rr-bar-sess"), valSess = $("#rr-val-sess");
+    if (barSess) {
+      if (s) {
+        const up = Date.now() - s.startedAt;
+        barSess.style.width = Math.min(100, (up / (4 * 3600 * 1000)) * 100) + "%";
+        valSess.textContent = fmtUptime(s.startedAt);
+      } else {
+        barSess.style.width = "0%";
+        valSess.textContent = "—";
+      }
+    }
+  }
+
+  function renderRight() {
+    const s = activeSession();
+
+    // active-session info card
+    const setTxt = (id, v) => { const e = $("#" + id); if (e) e.textContent = v; };
+    if (s) {
+      setTxt("rr-sess-agent", s.agentLabel || s.shell || "셸");
+      const stEl = $("#rr-sess-status");
+      if (stEl) { stEl.textContent = statusLabel(s.status); stEl.className = "rr-info-val rr-st-" + s.status; }
+      setTxt("rr-sess-cwd", s.cwd || "—");
+      const cwdEl = $("#rr-sess-cwd"); if (cwdEl) cwdEl.title = s.cwd || "";
+      setTxt("rr-sess-branch", s.branch ? "⎇ " + s.branch : "—");
+      setTxt("rr-sess-uptime", fmtUptime(s.startedAt));
+    } else {
+      ["rr-sess-agent", "rr-sess-cwd", "rr-sess-branch", "rr-sess-uptime"].forEach((id) => setTxt(id, "—"));
+      const stEl = $("#rr-sess-status"); if (stEl) { stEl.textContent = "—"; stEl.className = "rr-info-val"; }
+    }
+
+    // agent progress: status pill + activity
+    const prog = s && s.progress;
+    const pill = $("#rr-prog-status");
+    if (pill) {
+      const m = (prog && AGENT_ST[prog.status]) || null;
+      pill.textContent = m ? m[0] : "—";
+      pill.className = "rr-prog-pill" + (m && m[1] ? " " + m[1] : "");
+    }
+    const act = $("#rr-prog-activity");
+    if (act) act.textContent = (prog && prog.activity) || (s ? "활동 대기 중" : "세션 없음");
+
+    // context meter (real token usage when the agent reports it)
+    const ctxWrap = $("#rr-ctx-wrap"), ctxBar = $("#rr-ctx-bar"), ctxNums = $("#rr-ctx-nums");
+    if (ctxWrap) {
+      const c = prog && prog.context;
+      if (c && c.max) {
+        ctxWrap.hidden = false;
+        const pct = Math.min(100, Math.round((c.used / c.max) * 100));
+        if (ctxBar) { ctxBar.style.width = pct + "%"; ctxBar.className = "rr-bar " + barColorClass(pct); }
+        if (ctxNums) ctxNums.textContent = fmtTokens(c.used) + " / " + fmtTokens(c.max) + " · " + pct + "%";
+      } else {
+        ctxWrap.hidden = true;
+      }
+    }
+
+    // todos (real, e.g. claude TodoWrite)
+    const todoList = $("#rr-todo-list"), todoScore = $("#rr-todo-score");
+    if (todoList) {
+      const todos = (prog && prog.todos) || [];
+      todoList.innerHTML = "";
+      if (!todos.length) {
+        todoList.appendChild(el("div", "rr-empty", "—"));
+        if (todoScore) todoScore.textContent = "";
+      } else {
+        const done = todos.filter((t) => t.status === "completed").length;
+        if (todoScore) todoScore.textContent = done + "/" + todos.length;
+        todos.forEach((t) => {
+          const item = el("div", "rr-todo-item is-" + (t.status || "pending"));
+          const mark = t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "○";
+          item.appendChild(el("span", "rr-todo-check", mark));
+          item.appendChild(el("span", "rr-todo-text", t.text || ""));
+          todoList.appendChild(item);
+        });
+      }
+    }
+
+    // 도구 / 플러그인 used by the active session's agent
+    const toolsBox = $("#rr-tools");
+    if (toolsBox) {
+      const stats = (s && s.toolStats) || null;
+      const entries = stats ? Object.entries(stats).sort((a, b) => b[1] - a[1]) : [];
+      toolsBox.innerHTML = "";
+      if (!entries.length) {
+        toolsBox.appendChild(el("div", "rr-empty", "—"));
+      } else {
+        entries.slice(0, 24).forEach(([name, count]) => {
+          const isMcp = name.startsWith("mcp__");
+          const chip = el("span", "rr-tool" + (isMcp ? " is-mcp" : ""));
+          const label = isMcp ? "⧉ " + name.replace(/^mcp__/, "").replace(/__/g, "·") : name;
+          chip.appendChild(el("span", "rr-tool-name", label));
+          if (count > 1) chip.appendChild(el("span", "rr-tool-n", String(count)));
+          toolsBox.appendChild(chip);
+        });
+      }
+    }
+
+    // timeline
+    const tl = $("#rr-timeline");
+    if (tl) {
+      const entries = (s && s.timeline) || [];
+      tl.innerHTML = "";
+      if (!entries.length) {
+        tl.appendChild(el("div", "rr-empty", "활동 없음"));
+      } else {
+        entries.slice().reverse().forEach((e) => {
+          const row = el("div", "rr-tl-item");
+          row.appendChild(el("span", "rr-tl-dot rr-tl-dot-" + (e.color || "blue")));
+          row.appendChild(el("span", "rr-tl-text", e.text));
+          const meta = el("div", "rr-tl-meta");
+          meta.appendChild(el("span", "rr-tl-time", fmtClock(e.time)));
+          if (e.dur != null) meta.appendChild(el("span", "rr-tl-dur", e.dur));
+          row.appendChild(meta);
+          tl.appendChild(row);
+        });
+      }
+    }
+  }
+
+  /* ================================================================
+     TOP BAR + PAGE HEADER
+     ================================================================ */
+  function setConnection(v) {
+    store.connection = v;
+    const pill = $("#conn-pill");
+    if (pill) {
+      pill.dataset.state = v;
+      const lbl = pill.querySelector(".conn-label");
+      if (lbl) lbl.textContent = v === "connected" ? "Connected" : v === "error" ? "Disconnected" : "Connecting";
+    }
+    const chip = $("#chip-conn");
+    if (chip) chip.style.display = v === "connected" ? "" : "none";
+  }
+
+  function renderHeaderChips() {
+    const sessions = store.sessions;
+    const set = (sel, v) => { const e = $(sel); if (e) e.textContent = String(v); };
+    set("#chip-active-n", runningCount());
+    set("#chip-loaded-n", sessions.length);
+
+    const counts = {};
+    for (const s of sessions) { const k = projectName(s.cwd); counts[k] = (counts[k] || 0) + 1; }
+    const parts = Object.entries(counts).map(([k, n]) => `${k} ${n}`);
+    const chip = $("#chip-projects");
+    if (chip) { chip.textContent = parts.join(" · "); chip.style.display = parts.length ? "" : "none"; }
+  }
+
+  function pushNotification(n) {
+    store.notifications.unshift(Object.assign({ ts: Date.now(), read: false }, n));
+    renderUnread();
+  }
+  function renderUnread() {
+    const unread = store.notifications.filter((n) => !n.read).length;
+    const dot = $("#tb-unread");
+    if (dot) { dot.hidden = unread === 0; dot.textContent = unread > 9 ? "9+" : String(unread); }
+    const list = $("#bell-list");
+    if (list) {
+      if (!store.notifications.length) {
+        list.innerHTML = '<div class="dd-empty">에이전트 승인 및 알림이 여기에 표시됩니다.</div>';
+      } else {
+        list.innerHTML = "";
+        store.notifications.slice(0, 30).forEach((it) => {
+          const row = el("div", "dd-item");
+          row.innerHTML = `<div class="dd-item-title">${escapeHtml(it.title || "알림")}</div>` +
+            (it.body ? `<div class="dd-item-body u-muted">${escapeHtml(it.body)}</div>` : "");
+          list.appendChild(row);
+        });
+      }
+    }
+  }
+
+  function renderTodosView() {
+    const list = $("#tv-list"), score = $("#tv-score");
+    if (!list) return;
+    list.innerHTML = "";
+    const withTodos = store.sessions.filter((s) => s.progress && s.progress.todos && s.progress.todos.length);
+    let total = 0, done = 0;
+    withTodos.forEach((s) => { total += s.progress.todos.length; done += s.progress.todos.filter((t) => t.status === "completed").length; });
+    if (score) score.textContent = total ? (done + " / " + total) : "";
+    if (!withTodos.length) {
+      list.appendChild(el("div", "tv-empty", "활성 에이전트의 작업이 여기에 모입니다 — claude/codex 세션에서 작업하면 표시됩니다."));
+      return;
+    }
+    withTodos.forEach((s) => {
+      const card = el("div", "tv-card");
+      const head = el("div", "tv-card-head");
+      head.appendChild(el("span", "cx-tab-ic ag-" + (s.agent || "pwsh"), agentIcon(s.agent)));
+      head.appendChild(el("span", "tv-card-title", s.title));
+      const d = s.progress.todos.filter((t) => t.status === "completed").length;
+      head.appendChild(el("span", "tv-card-score", d + "/" + s.progress.todos.length));
+      head.addEventListener("click", () => { selectSession(s.id); gotoSessionsView(); });
+      card.appendChild(head);
+      s.progress.todos.forEach((t) => {
+        const item = el("div", "rr-todo-item is-" + (t.status || "pending"));
+        item.appendChild(el("span", "rr-todo-check", t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "○"));
+        item.appendChild(el("span", "rr-todo-text", t.text || ""));
+        card.appendChild(item);
+      });
+      list.appendChild(card);
+    });
+  }
+  function switchView(view) {
+    const tv = $("#todos-view");
+    if (tv) tv.hidden = (view !== "todos");
+    if (view === "todos") renderTodosView();
+  }
+  function gotoSessionsView() {
+    store.view = "dashboard";
+    $$("#tb-nav .tb-tab").forEach((t) => t.classList.toggle("active", t.dataset.view === "dashboard"));
+    switchView("dashboard");
+  }
+
+  function wireTopbar() {
+    $$("#tb-nav .tb-tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        $$("#tb-nav .tb-tab").forEach((t) => t.classList.toggle("active", t === tab));
+        store.view = tab.dataset.view;
+        switchView(store.view);
+      });
+    });
+
+    const bell = $("#tb-bell"), dd = $("#bell-dropdown");
+    if (bell && dd) {
+      bell.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const open = dd.hidden;
+        dd.hidden = !open;
+        bell.setAttribute("aria-expanded", String(open));
+        if (open) { store.notifications.forEach((n) => (n.read = true)); renderUnread(); }
+      });
+      document.addEventListener("click", (e) => {
+        if (!dd.hidden && !dd.contains(e.target) && e.target !== bell) {
+          dd.hidden = true; bell.setAttribute("aria-expanded", "false");
+        }
+      });
+    }
+
+    const gear = $("#tb-gear");
+    if (gear) gear.addEventListener("click", openSettings);
+
+    try {
+      const getWin = TAURI.window && TAURI.window.getCurrentWindow;
+      if (getWin) {
+        const win = getWin();
+        const min = $("#wc-min"), max = $("#wc-max"), close = $("#wc-close");
+        if (min) min.addEventListener("click", () => win.minimize());
+        if (max) max.addEventListener("click", () => win.toggleMaximize());
+        if (close) close.addEventListener("click", () => win.close());
+      }
+    } catch (_) {}
+  }
+
+  /* ================================================================
+     LEFT/CENTER/COMPOSER wiring
+     ================================================================ */
+  function defaultNewCwd() {
+    const act = activeSession();
+    return store.lastCwd || (act && act.cwd) || store.home;
+  }
+  function openNew(anchorBtn) {
+    if (settings.defaultAgent && settings.defaultAgent !== "ask") {
+      const cwd = defaultNewCwd();
+      store.lastCwd = cwd;
+      newSession({ agent: settings.defaultAgent, cwd });
+    } else {
+      openAgentMenu(anchorBtn);
+    }
+  }
+
+  function openAgentMenu(anchorBtn) {
+    document.querySelectorAll(".ns-menu").forEach((m) => m.remove());
+    const menu = el("div", "ns-menu");
+
+    // working-folder input (paste/edit the path the new session starts in)
+    const cwdRow = el("div", "ns-cwd-row");
+    const cwdInput = el("input", "ns-cwd");
+    cwdInput.type = "text";
+    cwdInput.value = defaultNewCwd();
+    cwdInput.placeholder = "작업 폴더 경로";
+    cwdInput.spellcheck = false;
+    cwdRow.appendChild(el("span", "ns-cwd-label", "폴더"));
+    cwdRow.appendChild(cwdInput);
+    const browseBtn = el("button", "ns-browse", "찾아보기");
+    browseBtn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      try {
+        const dlg = TAURI.dialog;
+        if (!dlg || !dlg.open) { cwdInput.focus(); return; }
+        const sel = await dlg.open({ directory: true, defaultPath: cwdInput.value || store.home });
+        if (sel) cwdInput.value = sel;
+      } catch (_) {}
+    });
+    cwdRow.appendChild(browseBtn);
+    menu.appendChild(cwdRow);
+
+    const pick = (key) => {
+      menu.remove();
+      const cwd = (cwdInput.value || "").trim() || store.home;
+      store.lastCwd = cwd;
+      newSession({ agent: key, cwd });
+    };
+    cwdInput.addEventListener("keydown", (e) => { if (e.key === "Enter") pick("pwsh"); });
+
+    AGENT_ORDER.forEach((key) => {
+      const a = AGENTS[key];
+      const item = el("button", "ns-item");
+      const dot = el("span", "ns-dot");
+      dot.style.background = ACCENT_HEX[a.accent] || ACCENT_HEX.green;
+      item.appendChild(dot);
+      item.appendChild(el("span", "ns-item-label", a.label));
+      item.addEventListener("click", () => pick(key));
+      menu.appendChild(item);
+    });
+
+    document.body.appendChild(menu);
+    const r = anchorBtn.getBoundingClientRect();
+    menu.style.left = r.left + "px";
+    menu.style.top = (r.bottom + 4) + "px";
+    menu.style.minWidth = Math.max(300, r.width) + "px";
+    cwdInput.focus();
+    cwdInput.select();
+    const close = (e) => { if (!menu.contains(e.target) && e.target !== anchorBtn) { menu.remove(); document.removeEventListener("mousedown", close); } };
+    setTimeout(() => document.addEventListener("mousedown", close), 0);
+  }
+
+  function wireLeft() {
+    const newBtn = $("#lr-new-session");
+    if (newBtn) newBtn.addEventListener("click", () => openNew(newBtn));
+
+    $$(".lr-seg").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        $$(".lr-seg").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        _seg = btn.dataset.seg || "project";
+        renderLeft();
+      });
+    });
+    const cb = $("#lr-active-only");
+    if (cb) cb.addEventListener("change", () => { _activeOnly = cb.checked; renderLeft(); });
+  }
+
+  function composerSend() {
+    const input = $("#cx-input");
+    const s = activeSession();
+    if (!input || !s || s.ptyId == null) return;
+    const text = input.value;
+    if (!text.length) return;
+    invoke("pty_write", { id: s.ptyId, data: text + "\r" });
+    s.msgCount = (s.msgCount || 0) + 1;
+    const msgN = $("#cx-msg-n");
+    if (msgN) msgN.textContent = String(s.msgCount);
+    pushTimeline(s, "메시지 전송", "blue");
+    input.value = "";
+    input.style.height = "";
+  }
+
+  function wireCenter() {
+    const tog = $("#cx-view-toggle");
+    if (tog) tog.querySelectorAll(".cvt").forEach((b) => b.addEventListener("click", () => {
+      const s = activeSession(); if (!s) return;
+      s.convView = (b.dataset.cv === "conv");
+      saveSessionState();
+      showSession(s.id);
+    }));
+    const input = $("#cx-input");
+    if (input) {
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); composerSend(); }
+      });
+      input.addEventListener("input", () => {
+        input.style.height = "auto";
+        input.style.height = Math.min(input.scrollHeight, 140) + "px";
+      });
+    }
+    const sendBtn = $("#cx-send-btn");
+    if (sendBtn) sendBtn.addEventListener("click", composerSend);
+
+    const editBtn = $("#cx-btn-edit");
+    if (editBtn) editBtn.addEventListener("click", () => {
+      const s = activeSession(); if (!s) return;
+      const t = prompt("세션 제목 수정:", s.title);
+      if (t !== null && t.trim()) renameSession(s.id, t.trim());
+    });
+    const pinBtn = $("#cx-btn-pin");
+    if (pinBtn) pinBtn.addEventListener("click", () => { const s = activeSession(); if (s) togglePin(s.id); });
+    const delBtn = $("#cx-btn-delete");
+    if (delBtn) delBtn.addEventListener("click", () => {
+      const s = activeSession(); if (!s) return;
+      if (confirm(`세션 "${s.title}" 을(를) 삭제하시겠습니까?`)) closeSession(s.id);
+    });
+  }
+
+  function wireHeader() {
+    const back = $("#ph-back");
+    if (back) back.addEventListener("click", () => { store.activeId = null; renderLeft(); showSession(null); renderRight(); });
+  }
+
+  /* ================================================================
+     TICKERS + POLLING
+     ================================================================ */
+  function startUptimeTicker() {
+    setInterval(() => {
+      const list = $("#lr-session-list");
+      if (list) {
+        list.querySelectorAll(".lr-uptime[data-started]").forEach((node) => {
+          const started = parseInt(node.dataset.started, 10);
+          if (!isNaN(started)) node.textContent = fmtUptime(started);
+        });
+      }
+      const s = activeSession();
+      const valSess = $("#rr-val-sess");
+      if (s && valSess) valSess.textContent = fmtUptime(s.startedAt);
+    }, 1000);
+  }
+
+  async function pollSystemStats() {
+    try {
+      const stats = await invoke("system_stats");
+      renderSystemCard(stats);
+    } catch (err) {
+      renderSystemCard({ cpu: 0, mem: 0 });
+    }
+  }
+
+  /* USAGE account cards from a local usage endpoint. */
+  function fmtResets(iso) {
+    const t = Date.parse(iso);
+    if (isNaN(t)) return "";
+    let s = Math.max(0, Math.floor((t - Date.now()) / 1000));
+    const h = Math.floor(s / 3600); s -= h * 3600;
+    const m = Math.floor(s / 60);
+    return "resets " + (h > 0 ? h + "h " : "") + m + "m";
+  }
+  function renderUsageCards(cards) {
+    const box = $("#rr-usage-cards");
+    if (!box) return;
+    box.innerHTML = "";
+    (cards || []).forEach((card) => {
+      const c = el("div", "rr-card");
+      const head = el("div", "rr-card-head");
+      head.appendChild(el("span", "rr-acct-label", card.account || "account"));
+      if (card.plan) head.appendChild(el("span", "rr-plan-badge", card.plan));
+      c.appendChild(head);
+      (card.rows || []).forEach((r) => {
+        let pct = r.pct || 0;
+        if (pct <= 1) pct = pct * 100;
+        pct = Math.round(pct);
+        const row = el("div", "rr-usage-row");
+        row.appendChild(el("span", "rr-usage-key", r.label));
+        const wrap = el("div", "rr-bar-wrap");
+        const bar = el("div", "rr-bar " + barColorClass(pct));
+        bar.style.width = Math.min(100, pct) + "%";
+        wrap.appendChild(bar);
+        row.appendChild(wrap);
+        const reset = r.resets_at ? " · " + fmtResets(r.resets_at) : "";
+        row.appendChild(el("span", "rr-usage-val " + valColorClass(pct), pct + "%" + reset));
+        c.appendChild(row);
+      });
+      if (card.extra) c.appendChild(el("div", "rr-ph-note", "추가 사용 가능"));
+      box.appendChild(c);
+    });
+  }
+  async function pollUsage() {
+    try { renderUsageCards(await invoke("usage_cards")); } catch (_) {}
+  }
+  function startUsagePolling() {
+    pollUsage();
+    // poll the backend CACHE often (cheap); the backend itself refreshes from the
+    // rate-limited upstream only every 60s.
+    setInterval(pollUsage, 5000);
+  }
+  let _statsTimer = null;
+  function startStatsPolling() {
+    pollSystemStats();
+    if (_statsTimer) clearInterval(_statsTimer);
+    _statsTimer = setInterval(pollSystemStats, settings.statsInterval || 2000);
+  }
+
+  /* ================================================================
+     Public surface
+     ================================================================ */
+  const App = {
+    store,
+    newSession, selectSession, closeSession, showSession,
+    renameSession, togglePin,
+    renderLeft, renderRight, renderTabs, renderHeaderChips,
+    setConnection, pushNotification,
+    sessionById, activeSession,
+    applyProgress,
+    fmtUptime, fmtClock,
+  };
+  window.App = App;
+
+  /* ================================================================
+     MAIN
+     ================================================================ */
+  async function main() {
+    wireTopbar();
+    wireHeader();
+    wireLeft();
+    wireCenter();
+    wireSettings();
+    setConnection("connecting");
+    renderHeaderChips();
+    renderUnread();
+    renderTabs();
+    renderRight();
+    startUptimeTicker();
+    applySettings();
+    startUsagePolling();
+
+    let home = "";
+    try { home = await invoke("app_home"); } catch (_) {}
+    if (home) store.home = home;
+    setConnection(home ? "connected" : "error");
+
+    const saved = loadSessionState();
+    if (settings.restoreSessions && saved && Array.isArray(saved.sessions) && saved.sessions.length) {
+      // restore previous sessions: reopen shells at their cwd; agents resume
+      for (const meta of saved.sessions) {
+        const sess = await newSession({ agent: meta.agent || "pwsh", cwd: meta.cwd || store.home, title: meta.title, resume: true });
+        if (sess) { if (meta.titleLocked) sess.titleLocked = true; if (meta.pinned) sess.pinned = true; if (meta.convView) sess.convView = true; }
+      }
+      renderLeft();
+      const act = store.sessions[saved.activeIndex] || store.sessions[0];
+      if (act) selectSession(act.id); else showSession(null);
+    } else {
+      const s1 = await newSession({ agent: "pwsh", cwd: store.home, title: projectName(store.home) });
+      if (s1) selectSession(s1.id); else showSession(null);
+    }
+
+    // persist the session list so a restart / reboot can restore it
+    setInterval(saveSessionState, 2000);
+    window.addEventListener("beforeunload", saveSessionState);
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", main);
+  else main();
+})();
