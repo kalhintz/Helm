@@ -315,12 +315,17 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
     loop {
         // wake the instant claude writes its transcript; 1.2s is just a safety net
         let _ = fs_rx.recv_timeout(Duration::from_millis(1200));
-        if !dir.exists() {
-            continue;
-        }
+
+        // Prefer the EXACT transcript path a Claude hook handed us; fall back to the
+        // cwd->slug guess. Claude often writes under a git-root slug (not cwd), so the
+        // guess can miss the file entirely — which is why token context went untracked.
+        let selected = crate::hook_server::transcript_for(&app, pty_id)
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| if dir.exists() { newest_jsonl(&dir, start) } else { None });
 
         // (re)select the active transcript; on switch, restart from byte 0.
-        if let Some(newest) = newest_jsonl(&dir, start) {
+        if let Some(newest) = selected {
             if cur_path.as_ref() != Some(&newest) {
                 cur_path = Some(newest);
                 offset = 0;

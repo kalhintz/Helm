@@ -20,6 +20,7 @@ pub struct HookHub {
     pub port: Mutex<u16>,
     cwd_to_pty: Mutex<HashMap<String, u32>>, // normalized cwd -> pty id
     active: Mutex<HashSet<u32>>,             // ptys receiving live hook events
+    transcript: Mutex<HashMap<u32, String>>, // pty -> exact transcript path (from hooks)
 }
 
 fn norm(cwd: &str) -> String {
@@ -41,6 +42,14 @@ pub fn register_session(app: &AppHandle, pty_id: u32, cwd: &str) {
 pub fn hooks_active(app: &AppHandle, pty_id: u32) -> bool {
     app.try_state::<HookHub>()
         .map_or(false, |h| h.active.lock().unwrap().contains(&pty_id))
+}
+
+/// Exact transcript path a Claude hook reported for this pty (beats the cwd->slug
+/// guess in the watcher, so token context reads the right file).
+pub fn transcript_for(app: &AppHandle, pty_id: u32) -> Option<String> {
+    let hub = app.try_state::<HookHub>()?;
+    let p = hub.transcript.lock().unwrap().get(&pty_id).cloned();
+    p
 }
 
 pub fn start(app: AppHandle) -> u16 {
@@ -120,6 +129,12 @@ fn process(app: &AppHandle, v: &Value) {
         None => return,
     };
     mark_active(app, pty);
+    // remember the exact transcript path so the watcher reads context from it
+    if let Some(tp) = v["transcript_path"].as_str() {
+        if let Some(hub) = app.try_state::<HookHub>() {
+            hub.transcript.lock().unwrap().insert(pty, tp.to_string());
+        }
+    }
     match ev {
         "UserPromptSubmit" => emit(app, pty, json!({ "status": "working", "activity": "" })),
         "PreToolUse" => {
