@@ -236,6 +236,13 @@
     fontSize: 12.5, cursorBlink: true, defaultAgent: "ask", statsInterval: 2000,
     restoreSessions: true,
     show: { progress: true, todos: true, tools: true, usage: true, timeline: true },
+    // Real OS notifications (Windows toast / mac / linux native) via the
+    // notify_os Tauri command — fire even when Helm is minimized/unfocused.
+    notify: {
+      os: true,        // master switch for OS notifications
+      turnDone: true,  // notify when an agent turn completes
+      awaiting: true,  // notify when an agent awaits input
+    },
     opencode: {
       notifyTurnDone: true,   // toast when an opencode turn completes
       notifyAwaiting: true,   // toast when opencode awaits prompt input
@@ -293,6 +300,7 @@
     try { s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); } catch (_) { s = {}; }
     const merged = Object.assign({}, DEFAULT_SETTINGS, s);
     merged.show = Object.assign({}, DEFAULT_SETTINGS.show, s.show || {});
+    merged.notify = Object.assign({}, DEFAULT_SETTINGS.notify, s.notify || {});
     merged.opencode = Object.assign({}, DEFAULT_SETTINGS.opencode, s.opencode || {});
     merged.multiAccount = Object.assign({}, DEFAULT_SETTINGS.multiAccount, s.multiAccount || {});
     if (!Array.isArray(merged.multiAccount.order)) merged.multiAccount.order = [];
@@ -327,6 +335,11 @@
     if (st) st.value = String(settings.statsInterval);
     $$(".set-show").forEach((cb) => { cb.checked = !!settings.show[cb.dataset.sec]; });
     const rs = $("#set-restore"); if (rs) rs.checked = !!settings.restoreSessions;
+    const noti = settings.notify || {};
+    const notiSet = (id, v) => { const cb = $("#" + id); if (cb) cb.checked = !!v; };
+    notiSet("set-notify-os", noti.os);
+    notiSet("set-notify-turndone", noti.turnDone);
+    notiSet("set-notify-awaiting", noti.awaiting);
     const ococ = settings.opencode || {};
     const ocSet = (id, v) => { const cb = $("#" + id); if (cb) cb.checked = !!v; };
     ocSet("set-oc-turndone", ococ.notifyTurnDone);
@@ -381,6 +394,17 @@
     $$(".set-show").forEach((cb) => cb.addEventListener("change", () => { settings.show[cb.dataset.sec] = cb.checked; saveSettings(); applySettings(); }));
     const rs = $("#set-restore");
     if (rs) rs.addEventListener("change", () => { settings.restoreSessions = rs.checked; saveSettings(); });
+    const notiBind = (id, key) => {
+      const cb = $("#" + id);
+      if (cb) cb.addEventListener("change", () => {
+        settings.notify = settings.notify || {};
+        settings.notify[key] = cb.checked;
+        saveSettings();
+      });
+    };
+    notiBind("set-notify-os", "os");
+    notiBind("set-notify-turndone", "turnDone");
+    notiBind("set-notify-awaiting", "awaiting");
     const ocBind = (id, key) => {
       const cb = $("#" + id);
       if (cb) cb.addEventListener("change", () => {
@@ -774,8 +798,12 @@
   function onTurnDone(session, payload) {
     if (!session) return;
     if (settings.opencode && settings.opencode.notifyTurnDone === false) return;
-    const mode = (payload && (payload.title || payload.model)) || session.agentLabel || "opencode";
-    pushNotification({ title: session.title, body: mode + " — 턴 완료" });
+    const agent = (payload && payload.title) || session.agentLabel || session.agent || "agent";
+    const proj = projectName(session.cwd) || session.title || "Helm";
+    const body = agent + " · 턴 완료";
+    pushNotification({ title: session.title, body });
+    // Real OS toast — fires even when Helm is minimized/unfocused.
+    if (!settings.notify || settings.notify.turnDone !== false) notifyOs(proj, body);
     if (store.activeId !== session.id) markAttention(session);
   }
 
@@ -959,6 +987,10 @@
       session.status = "attention";
       pushTimeline(session, "입력 대기 (주의 필요)", "orange");
       pushNotification({ title: session.title, body: "에이전트가 입력을 기다립니다" });
+      // Real OS toast for awaiting-input (gated separately so it can be muted).
+      if (!settings.notify || settings.notify.awaiting !== false) {
+        notifyOs(projectName(session.cwd) || session.title || "Helm", "입력 대기");
+      }
       App.renderLeft();
       App.renderHeaderChips();
     }
@@ -1545,6 +1577,14 @@
   function pushNotification(n) {
     store.notifications.unshift(Object.assign({ ts: Date.now(), read: false }, n));
     renderUnread();
+  }
+  /* Real OS notification (Windows toast / mac / linux native) via the backend
+     notify_os command — visible even when Helm is minimized/unfocused. Best-
+     effort: gated by the notify.os master switch, failures are swallowed. The
+     per-event gate (turnDone / awaiting) is applied by the caller. */
+  function notifyOs(title, body) {
+    if (!settings.notify || settings.notify.os === false) return;
+    try { invoke("notify_os_cmd", { title: title || "Helm", body: body || "" }); } catch (_) {}
   }
   function renderUnread() {
     const unread = store.notifications.filter((n) => !n.read).length;

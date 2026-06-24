@@ -859,16 +859,134 @@ fn claude_switch_account(profile: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Best-effort OS notification (Windows toast / macOS / Linux native) via
+/// tauri-plugin-notification. Errors are swallowed — a notification must never
+/// disturb the session. Exposed as a command so the frontend can fire it from
+/// its existing `onTurnDone` / `markAttention` listeners (gated by JS settings)
+/// without threading those settings into Rust.
+pub fn notify_os(app: &AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
+}
+
+#[tauri::command]
+fn notify_os_cmd(app: AppHandle, title: String, body: String) {
+    notify_os(&app, &title, &body);
+}
+
+/// Register an AppUserModelID via a Start-Menu shortcut so Windows toasts from a
+/// portable helm.exe actually appear. Windows refuses to surface a toast whose
+/// originating process has no registered AUMID; an installed app gets one from
+/// its installer, but a portable exe does not. The fix Microsoft documents is a
+/// Start-Menu .lnk carrying the `System.AppUserModel.ID` property — once it
+/// exists, toasts tagged with that same AUMID (which tauri-plugin-notification
+/// derives from the bundle identifier `com.helm.app`) are shown.
+///
+/// We build the shortcut with PowerShell (WScript.Shell for the .lnk + a tiny
+/// property-store COM call for the AUMID). The Command uses
+/// `.creation_flags(NO_WINDOW)` so no console flashes, and we skip the work
+/// entirely if the shortcut already exists (idempotent, runs only on first
+/// launch).
+#[cfg(windows)]
+fn ensure_aumid_shortcut() {
+    const AUMID: &str = "com.helm.app"; // must match tauri.conf.json identifier
+
+    let Some(appdata) = std::env::var_os("APPDATA") else { return };
+    let link = std::path::Path::new(&appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Helm.lnk");
+    if link.exists() {
+        return; // already registered — nothing to do
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+
+    // PowerShell: create the .lnk pointing at our exe, then stamp the
+    // System.AppUserModel.ID (PKEY 9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3,100) on it
+    // via the IPropertyStore COM interface so the toast is attributed to us.
+    let ps = format!(
+        r#"
+$ErrorActionPreference='SilentlyContinue'
+$link='{link}'
+$dir=Split-Path $link
+if(!(Test-Path $dir)){{New-Item -ItemType Directory -Force -Path $dir|Out-Null}}
+$sh=New-Object -ComObject WScript.Shell
+$sc=$sh.CreateShortcut($link)
+$sc.TargetPath='{exe}'
+$sc.Save()
+$code=@'
+using System;
+using System.Runtime.InteropServices;
+namespace HelmAumid {{
+  public static class Lnk {{
+    [StructLayout(LayoutKind.Sequential)] public struct PropertyKey {{ public Guid fmtid; public uint pid; }}
+    [StructLayout(LayoutKind.Sequential)] public struct PropVariant {{ public ushort vt; ushort r1; ushort r2; ushort r3; public IntPtr p; IntPtr p2; }}
+    [DllImport("ole32.dll")] static extern int PropVariantClear(ref PropVariant pv);
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore {{
+      int GetCount(out uint c);
+      int GetAt(uint i, out PropertyKey k);
+      int GetValue(ref PropertyKey k, out PropVariant pv);
+      int SetValue(ref PropertyKey k, ref PropVariant pv);
+      int Commit();
+    }}
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")] class CShellLink {{}}
+    [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPersistFile {{ void GetClassID(out Guid p); int IsDirty(); int Load(string f,int m); int Save(string f,bool r); int SaveCompleted(string f); int GetCurFile(out string f); }}
+    [DllImport("ole32.dll")] static extern int CoInitialize(IntPtr p);
+    public static void Set(string lnk,string aumid) {{
+      CoInitialize(IntPtr.Zero);
+      var o=new CShellLink();
+      ((IPersistFile)o).Load(lnk,2);
+      var ps=(IPropertyStore)o;
+      PropertyKey k; k.fmtid=new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"); k.pid=5;
+      var pv=new PropVariant(); pv.vt=31; pv.p=Marshal.StringToCoTaskMemUni(aumid);
+      ps.SetValue(ref k,ref pv); ps.Commit();
+      ((IPersistFile)o).Save(lnk,true);
+      PropVariantClear(ref pv);
+    }}
+  }}
+}}
+'@
+Add-Type -TypeDefinition $code -Language CSharp
+[HelmAumid.Lnk]::Set($link,'{aumid}')
+"#,
+        link = link.display().to_string().replace('\'', "''"),
+        exe = exe.display().to_string().replace('\'', "''"),
+        aumid = AUMID,
+    );
+
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
+        .creation_flags(NO_WINDOW)
+        .output();
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(PtyState::default())
         .manage(OcPorts::default())
         .manage(hook_server::HookHub::default())
         .manage(mobile::Bus::default())
         .manage(mobile::MobileState::default())
         .setup(|app| {
+            // Windows toast reliability: a portable (non-installed) exe has no
+            // registered AppUserModelID, so tauri-plugin-notification's toast would
+            // silently no-op. Create a Start-Menu shortcut carrying our AUMID
+            // (= the app identifier from tauri.conf.json) once on first launch so
+            // Windows associates the toast with us. Idempotent: skips if present.
+            #[cfg(windows)]
+            std::thread::spawn(ensure_aumid_shortcut);
             // Native-hook receiver: agents POST lifecycle events here for instant
             // progress/tasks/completion (see hook_server). Falls back silently to
             // the transcript watchers when an agent has no hook registered.
@@ -945,6 +1063,7 @@ fn main() {
             opencode_open_models,
             claude_account_profiles,
             claude_switch_account,
+            notify_os_cmd,
             mobile::mobile_info
         ])
         .run(tauri::generate_context!())

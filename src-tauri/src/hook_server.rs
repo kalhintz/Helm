@@ -21,6 +21,7 @@ pub struct HookHub {
     cwd_to_pty: Mutex<HashMap<String, u32>>, // normalized cwd -> pty id
     active: Mutex<HashSet<u32>>,             // ptys receiving live hook events
     transcript: Mutex<HashMap<u32, String>>, // pty -> exact transcript path (from hooks)
+    last_turn_done: Mutex<HashMap<u32, u64>>, // pty -> last turn-done emit (ms; debounce)
 }
 
 fn norm(cwd: &str) -> String {
@@ -156,8 +157,39 @@ fn process(app: &AppHandle, v: &Value) {
             }
         }
         "Notification" => emit(app, pty, json!({ "status": "waiting" })),
-        "Stop" => emit(app, pty, json!({ "status": "idle" })),
+        "Stop" => {
+            emit(app, pty, json!({ "status": "idle" }));
+            // Claude's Stop hook = turn finished. Emit the turn-done edge (debounced
+            // per pty) so the frontend onTurnDone listener fires for Claude too —
+            // matching opencode (DB edge) and codex (watcher edge).
+            if turn_done_debounced(app, pty) {
+                crate::mobile::emit_all(
+                    app,
+                    &format!("agent-turn-done:{pty}"),
+                    json!({ "title": "claude" }),
+                );
+            }
+        }
         _ => {}
+    }
+}
+
+/// Per-pty turn-done debounce (>=2s). Claude can fire Stop twice in quick
+/// succession (subagent + main); this collapses the burst so the OS isn't
+/// spammed. Returns true when the caller should emit agent-turn-done.
+fn turn_done_debounced(app: &AppHandle, pty: u32) -> bool {
+    let Some(hub) = app.try_state::<HookHub>() else { return true };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut map = hub.last_turn_done.lock().unwrap();
+    let last = map.get(&pty).copied().unwrap_or(0);
+    if now.saturating_sub(last) >= 2000 {
+        map.insert(pty, now);
+        true
+    } else {
+        false
     }
 }
 

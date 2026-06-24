@@ -4,6 +4,22 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.10.0] — 2026-06-25
+
+### Added
+
+- **OS notifications on turn completion** — when an agent finishes a turn, Helm
+  fires a real desktop notification (not just the in-app toast), so you're
+  notified even when Helm is minimized or unfocused — for **Claude, Codex, and
+  opencode** (previously only opencode had any turn-done signal, and only in-app).
+  Claude uses its `Stop` hook, Codex and opencode use their watcher's
+  working→idle edge, all debounced. An optional notification also fires when a
+  session is awaiting input. New "OS 알림" settings group toggles the OS
+  notification, turn-done, and awaiting-input alerts.
+  - On Windows, a portable `helm.exe` has no registered AppUserModelID, which
+    would make toasts silently no-op; Helm registers one via a Start-Menu shortcut
+    on first launch so notifications actually appear.
+
 ## [0.9.0] — 2026-06-25
 
 ### Added
@@ -256,6 +272,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.10.0]: https://github.com/kalhintz/Helm/releases/tag/v0.10.0
 [0.9.0]: https://github.com/kalhintz/Helm/releases/tag/v0.9.0
 [0.8.1]: https://github.com/kalhintz/Helm/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kalhintz/Helm/releases/tag/v0.8.0

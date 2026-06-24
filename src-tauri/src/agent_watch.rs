@@ -475,6 +475,11 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let mut state = ClaudeState::default();
     let mut last_sig = String::new();
     let mut pending: HashMap<String, String> = HashMap::new();
+    // turn-complete edge fallback (working -> idle) for when no Stop hook arrives
+    // (e.g. claude launched without hooks). When hooks ARE live the Stop hook owns
+    // the turn-done emit, so this only fires under !hooks_active — no double-fire.
+    let mut prev_status = String::new();
+    let mut last_turn_done_ms: u64 = 0;
     let (_fs_watch, fs_rx) = dir_signal(&projects);
 
     loop {
@@ -572,6 +577,23 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
                 emit_all(&app, &evt, &prog);
             }
         }
+        // ---- notification edge-trigger fallback: turn complete (working -> idle) ----
+        // Only when no hook is live for this pty — otherwise the Stop hook owns it.
+        if !crate::hook_server::hooks_active(&app, pty_id)
+            && prev_status == "working"
+            && prog.status == "idle"
+        {
+            let now = now_ms();
+            if now.saturating_sub(last_turn_done_ms) >= 2000 {
+                last_turn_done_ms = now;
+                emit_all(
+                    &app,
+                    &format!("agent-turn-done:{pty_id}"),
+                    serde_json::json!({ "title": "claude" }),
+                );
+            }
+        }
+        prev_status = prog.status.clone();
     }
 }
 
@@ -1177,6 +1199,9 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
     let mut state = CodexState::default();
     let mut last_sig = String::new();
     let mut pending: HashMap<String, String> = HashMap::new();
+    // turn-complete edge-trigger (working -> idle), mirroring opencode/claude.
+    let mut prev_status = String::new();
+    let mut last_turn_done_ms: u64 = 0;
     let (_fs_watch, fs_rx) = dir_signal(&root);
 
     loop {
@@ -1243,6 +1268,21 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
             // instant; the Codex hook just adds an earlier status/turn nudge.
             emit_all(&app, &evt, &prog);
         }
+        // ---- notification edge-trigger: turn complete (working -> idle) ----
+        // Codex's task_complete flips to_progress() to "idle"; fire once on that
+        // edge (debounced) so the frontend onTurnDone listener can OS-notify.
+        if prev_status == "working" && prog.status == "idle" {
+            let now = now_ms();
+            if now.saturating_sub(last_turn_done_ms) >= 2000 {
+                last_turn_done_ms = now;
+                emit_all(
+                    &app,
+                    &format!("agent-turn-done:{pty_id}"),
+                    serde_json::json!({ "title": "codex" }),
+                );
+            }
+        }
+        prev_status = prog.status.clone();
     }
 }
 
