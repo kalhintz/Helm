@@ -784,6 +784,7 @@ struct CodexState {
     last_turn: String,
     tools: Vec<ToolEvent>,
     used_tokens: u64,
+    todos: Vec<TodoItem>,
 }
 impl CodexState {
     fn ingest(&mut self, v: &Value) {
@@ -811,6 +812,22 @@ impl CodexState {
                 match p["type"].as_str().unwrap_or("") {
                     "function_call" => {
                         let name = p["name"].as_str().unwrap_or("call").to_string();
+                        // Codex's plan tool mirrors Claude's todo list: plan[{step,status}].
+                        if name == "update_plan" {
+                            if let Some(plan) = p["arguments"]
+                                .as_str()
+                                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                                .and_then(|av| av["plan"].as_array().cloned())
+                            {
+                                self.todos = plan
+                                    .iter()
+                                    .map(|s| TodoItem {
+                                        text: s["step"].as_str().unwrap_or("").to_string(),
+                                        status: s["status"].as_str().unwrap_or("pending").to_string(),
+                                    })
+                                    .collect();
+                            }
+                        }
                         let summary = p["arguments"]
                             .as_str()
                             .map(|s| s.replace(['\n', '\r'], " ").chars().take(60).collect::<String>())
@@ -866,11 +883,12 @@ impl CodexState {
             None
         };
         let tools = self.tools.iter().rev().take(20).rev().cloned().collect();
-        AgentProgress { status: status.into(), activity, todos: vec![], tools, context }
+        AgentProgress { status: status.into(), activity, todos: self.todos.clone(), tools, context }
     }
     fn signature(&self, p: &AgentProgress) -> String {
         let last_ts = self.tools.last().map(|t| t.ts.as_str()).unwrap_or("");
-        format!("{}|{}|{}|{}|{}", p.status, p.activity, self.tools.len(), last_ts, self.used_tokens)
+        let todo_sig: String = self.todos.iter().map(|t| t.status.chars().next().unwrap_or('?')).collect();
+        format!("{}|{}|{}|{}|{}|{}|{}", p.status, p.activity, self.tools.len(), last_ts, self.used_tokens, self.todos.len(), todo_sig)
     }
 }
 

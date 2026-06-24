@@ -1027,48 +1027,60 @@
     const list = $("#tv-list"), score = $("#tv-score");
     if (!list) return;
     list.innerHTML = "";
-    const withTodos = store.sessions.filter((s) => s.progress && s.progress.todos && s.progress.todos.length);
-    let total = 0, done = 0;
-    withTodos.forEach((s) => { total += s.progress.todos.length; done += s.progress.todos.filter((t) => t.status === "completed").length; });
-    if (score) score.textContent = total ? (done + " / " + total) : "";
-    if (!withTodos.length) {
+    // "현재 활성" board: one card per running agent session (claude/codex/opencode)
+    // showing what it's doing — title, status + elapsed, agent/folder, context bar.
+    const agents = store.sessions.filter((s) => AGENTS[s.agent] && AGENTS[s.agent].launch);
+    if (score) score.textContent = agents.length ? (agents.length + "개 세션") : "";
+    if (!agents.length) {
       const empty = el("div", "tv-empty");
       empty.appendChild(el("div", "tv-empty-ic", "✓"));
-      empty.appendChild(el("div", "tv-empty-title", "아직 작업이 없습니다"));
-      empty.appendChild(el("div", "tv-empty-sub", "claude · codex 세션에서 작업이 시작되면 상태와 함께 여기에 모입니다."));
+      empty.appendChild(el("div", "tv-empty-title", "활성 에이전트 세션이 없습니다"));
+      empty.appendChild(el("div", "tv-empty-sub", "claude · codex · opencode 세션을 시작하면 진행 중인 작업이 여기에 한눈에 모입니다."));
       list.appendChild(empty);
       return;
     }
-    withTodos.forEach((s) => {
-      const todos = s.progress.todos;
-      const d = todos.filter((t) => t.status === "completed").length;
-      const pct = todos.length ? Math.round((d / todos.length) * 100) : 0;
 
-      const card = el("div", "tv-card");
+    const fmtTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+    const fmtAge = (ms) => {
+      const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+      return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s % 60}s`;
+    };
+    const statusText = (st) => ({ working: "작업 중", waiting: "입력 대기", attention: "입력 대기", idle: "대기 중", done: "완료됨", error: "오류", spawning: "시작 중", running: "실행 중" }[st] || st || "대기 중");
+
+    agents.forEach((s) => {
+      const prog = s.progress || {};
+      const st = prog.status || s.status || "idle";
+      const ctx = prog.context;
+
+      const card = el("div", "tv-card is-" + st);
+      card.addEventListener("click", () => { selectSession(s.id); gotoSessionsView(); });
 
       const head = el("div", "tv-card-head");
-      head.appendChild(el("span", "cx-tab-ic ag-" + (s.agent || "pwsh"), agentIcon(s.agent)));
-      head.appendChild(el("span", "tv-card-title", s.title));
-      head.appendChild(el("span", "badge tv-card-badge", d + "/" + todos.length));
-      head.addEventListener("click", () => { selectSession(s.id); gotoSessionsView(); });
+      head.appendChild(el("span", "tv-dot is-" + st));
+      head.appendChild(el("span", "tv-card-title", s.title || projectName(s.cwd)));
+      const right = el("div", "tv-card-right");
+      right.appendChild(el("span", "tv-status is-" + st, statusText(st)));
+      right.appendChild(el("span", "tv-elapsed", "⏱ " + fmtAge(Date.now() - (s.startedAt || Date.now()))));
+      head.appendChild(right);
       card.appendChild(head);
 
-      const bar = el("div", "tv-progress");
-      const fill = el("div", "tv-progress-fill" + (pct === 100 ? " is-done" : ""));
-      fill.style.width = pct + "%";
-      bar.appendChild(fill);
-      card.appendChild(bar);
+      const meta = el("div", "tv-meta");
+      meta.appendChild(el("span", "tv-meta-agent", s.agentLabel || s.agent));
+      meta.appendChild(el("span", "tv-meta-sep", "·"));
+      meta.appendChild(el("span", "tv-meta-folder", "📁 " + projectName(s.cwd)));
+      if (s.branch) { meta.appendChild(el("span", "tv-meta-sep", "·")); meta.appendChild(el("span", "tv-meta-branch", s.branch)); }
+      card.appendChild(meta);
 
-      const items = el("div", "tv-items");
-      todos.forEach((t) => {
-        const st = t.status || "pending";
-        const item = el("div", "tv-item is-" + st);
-        item.appendChild(el("span", "tv-check", st === "completed" ? "✓" : ""));
-        item.appendChild(el("span", "tv-item-text", t.text || ""));
-        if (st === "in_progress") item.appendChild(el("span", "badge badge-amber tv-item-badge", "진행 중"));
-        items.appendChild(item);
-      });
-      card.appendChild(items);
+      const ctxRow = el("div", "tv-ctx");
+      ctxRow.appendChild(el("span", "tv-ctx-label", "컨텍스트"));
+      const bar = el("div", "tv-ctx-bar");
+      const fill = el("div", "tv-ctx-fill is-" + st);
+      fill.style.width = (ctx ? Math.min(100, ctx.pct) : 0) + "%";
+      bar.appendChild(fill);
+      ctxRow.appendChild(bar);
+      ctxRow.appendChild(el("span", "tv-ctx-num", ctx ? (fmtTok(ctx.used) + " / " + fmtTok(ctx.max)) : "—"));
+      card.appendChild(ctxRow);
+
       list.appendChild(card);
     });
   }
