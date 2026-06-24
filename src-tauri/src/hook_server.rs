@@ -13,7 +13,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 #[derive(Default)]
 pub struct HookHub {
@@ -109,7 +109,7 @@ fn mark_active(app: &AppHandle, pty: u32) {
 }
 
 fn emit(app: &AppHandle, pty: u32, payload: Value) {
-    let _ = app.emit(&format!("agent-progress:{pty}"), payload);
+    crate::mobile::emit_all(app, &format!("agent-progress:{pty}"), payload);
 }
 
 fn process(app: &AppHandle, v: &Value) {

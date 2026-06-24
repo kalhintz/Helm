@@ -4,6 +4,7 @@
 
 mod agent_watch;
 mod hook_server;
+mod mobile;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -20,7 +21,7 @@ use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 struct PtyInstance {
     master: Box<dyn MasterPty + Send>,
@@ -72,6 +73,25 @@ fn pty_spawn(
     cwd: Option<String>,
     cols: u16,
     rows: u16,
+    workspace_id: Option<String>,
+    surface_id: Option<String>,
+    agent: Option<String>,
+) -> Result<u32, String> {
+    pty_spawn_impl(app, &state, shell, cwd, cols, rows, workspace_id, surface_id, agent)
+}
+
+/// Plain impl so both the Tauri command wrapper and the mobile dispatcher can spawn
+/// a pty without Tauri's State-injection magic. Body is the original `pty_spawn`,
+/// with the two reader-thread emits routed through `mobile::emit_all` so WS clients
+/// see terminal output too.
+#[allow(clippy::too_many_arguments)]
+fn pty_spawn_impl(
+    app: AppHandle,
+    state: &PtyState,
+    shell: String,
+    cwd: Option<String>,
+    cols: u16,
+    rows: u16,
     _workspace_id: Option<String>,
     _surface_id: Option<String>,
     agent: Option<String>,
@@ -116,13 +136,14 @@ fn pty_spawn(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                    if app_data.emit(&evt, DataPayload { b64 }).is_err() {
-                        break;
-                    }
+                    // Fan out to the webview AND any connected mobile WS clients. The
+                    // loop now ends only on PTY EOF (Ok(0)/Err above), so output keeps
+                    // streaming to the phone even if the desktop webview is gone.
+                    mobile::emit_all(&app_data, &evt, DataPayload { b64 });
                 }
             }
         }
-        let _ = app_data.emit(&format!("pty-exit:{id}"), ());
+        mobile::emit_all(&app_data, &format!("pty-exit:{id}"), ());
     });
 
     // reap child so it doesn't linger as a zombie
@@ -141,6 +162,9 @@ fn pty_spawn(
 
 #[tauri::command]
 fn pty_write(state: State<PtyState>, id: u32, data: String) -> Result<(), String> {
+    pty_write_impl(&state, id, data)
+}
+fn pty_write_impl(state: &PtyState, id: u32, data: String) -> Result<(), String> {
     if let Some(inst) = state.map.lock().unwrap().get_mut(&id) {
         inst.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
         let _ = inst.writer.flush();
@@ -150,6 +174,9 @@ fn pty_write(state: State<PtyState>, id: u32, data: String) -> Result<(), String
 
 #[tauri::command]
 fn pty_resize(state: State<PtyState>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
+    pty_resize_impl(&state, id, cols, rows)
+}
+fn pty_resize_impl(state: &PtyState, id: u32, cols: u16, rows: u16) -> Result<(), String> {
     if let Some(inst) = state.map.lock().unwrap().get(&id) {
         inst.master
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -161,6 +188,102 @@ fn pty_resize(state: State<PtyState>, id: u32, cols: u16, rows: u16) -> Result<(
 #[tauri::command]
 fn pty_kill(state: State<PtyState>, id: u32) {
     state.map.lock().unwrap().remove(&id);
+}
+
+/// Bridge: dispatch a mobile WS command to the same backend logic the desktop
+/// webview drives through invoke_handler. State is resolved from the AppHandle
+/// (the WS thread doesn't carry Tauri's injected State args). Keep this in sync
+/// with the invoke_handler list above.
+pub fn dispatch_mobile_command(
+    app: &AppHandle,
+    cmd: &str,
+    args: &Value,
+    reply: &dyn Fn(Value),
+    reply_err: &dyn Fn(String),
+) {
+    use serde_json::json;
+    let u16a = |k: &str| args[k].as_u64().map(|n| n as u16);
+    let u32a = |k: &str| args[k].as_u64().map(|n| n as u32);
+    let stra = |k: &str| args[k].as_str().map(|s| s.to_string());
+
+    match cmd {
+        "pty_spawn" => {
+            let state = app.state::<PtyState>();
+            let r = pty_spawn_impl(
+                app.clone(),
+                &state,
+                stra("shell").unwrap_or_default(),
+                stra("cwd"),
+                u16a("cols").unwrap_or(80),
+                u16a("rows").unwrap_or(24),
+                stra("workspaceId"),
+                stra("surfaceId"),
+                stra("agent"),
+            );
+            match r {
+                Ok(id) => reply(json!(id)),
+                Err(e) => reply_err(e),
+            }
+        }
+        "pty_write" => {
+            let state = app.state::<PtyState>();
+            match (u32a("id"), stra("data")) {
+                (Some(id), Some(data)) => match pty_write_impl(&state, id, data) {
+                    Ok(()) => reply(json!(null)),
+                    Err(e) => reply_err(e),
+                },
+                _ => reply_err("pty_write: bad args".into()),
+            }
+        }
+        "pty_resize" => {
+            let state = app.state::<PtyState>();
+            if let (Some(id), Some(cols), Some(rows)) = (u32a("id"), u16a("cols"), u16a("rows")) {
+                match pty_resize_impl(&state, id, cols, rows) {
+                    Ok(()) => reply(json!(null)),
+                    Err(e) => reply_err(e),
+                }
+            } else {
+                reply_err("pty_resize: bad args".into());
+            }
+        }
+        "pty_kill" => {
+            let state = app.state::<PtyState>();
+            if let Some(id) = u32a("id") {
+                state.map.lock().unwrap().remove(&id);
+            }
+            reply(json!(null));
+        }
+        "start_agent_watch" => {
+            if let (Some(id), Some(agent), Some(cwd)) = (u32a("id"), stra("agent"), stra("cwd")) {
+                start_agent_watch(app.clone(), id, agent, cwd);
+            }
+            reply(json!(null));
+        }
+        "git_branch" => reply(json!(git_branch(stra("cwd").unwrap_or_default()))),
+        "app_home" => reply(json!(app_home())),
+        "app_selftest" => reply(json!(app_selftest())),
+        "listening_ports" => reply(json!(listening_ports())),
+        "system_stats" => {
+            let v = app
+                .try_state::<StatsCache>()
+                .and_then(|s| serde_json::to_value(s.0.lock().unwrap().clone()).ok())
+                .unwrap_or(json!(null));
+            reply(v);
+        }
+        "usage_cards" => {
+            let v = app
+                .try_state::<UsageCache>()
+                .and_then(|c| serde_json::to_value(c.0.lock().unwrap().clone()).ok())
+                .unwrap_or(json!([]));
+            reply(v);
+        }
+        "mobile_info" => {
+            let s = app.state::<mobile::MobileState>();
+            reply(serde_json::to_value(mobile::mobile_info(s)).unwrap_or(json!(null)));
+        }
+        // clipboard plugin commands are no-ops on mobile (browser uses navigator.clipboard)
+        other => reply_err(format!("unknown command: {other}")),
+    }
 }
 
 #[tauri::command]
@@ -424,6 +547,8 @@ fn main() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(PtyState::default())
         .manage(hook_server::HookHub::default())
+        .manage(mobile::Bus::default())
+        .manage(mobile::MobileState::default())
         .setup(|app| {
             // Native-hook receiver: agents POST lifecycle events here for instant
             // progress/tasks/completion (see hook_server). Falls back silently to
@@ -435,6 +560,10 @@ fn main() {
                 }
                 hook_server::write_forwarder(port);
             }
+            // Mobile bridge (Phase A): LAN HTTP + WS so a phone on the same wifi can
+            // open the identical embedded UI and drive sessions. Both servers run on
+            // their own threads; see mobile.rs.
+            mobile::start(app.handle().clone());
             // System-stats cache refreshed off the request path (sysinfo, cross-
             // platform) so the command never does blocking work inside the IPC loop.
             app.manage(StatsCache::default());
@@ -486,7 +615,8 @@ fn main() {
             listening_ports,
             system_stats,
             start_agent_watch,
-            usage_cards
+            usage_cards,
+            mobile::mobile_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running helm");

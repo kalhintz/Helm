@@ -39,7 +39,9 @@ fn dir_signal(dir: &Path) -> (Option<notify::RecommendedWatcher>, Receiver<()>) 
 
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
+
+use crate::mobile::emit_all;
 
 #[derive(Clone, Serialize, Default)]
 pub struct AgentProgress {
@@ -201,7 +203,7 @@ fn claude_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut 
             tool_calls,
             usage,
         };
-        let _ = app.emit(&format!("conv-msg:{pty_id}"), &m);
+        emit_all(app, &format!("conv-msg:{pty_id}"), &m);
     } else if typ == "user" {
         let content = &msg["content"];
         if let Some(arr) = content.as_array() {
@@ -220,7 +222,7 @@ fn claude_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut 
                         status: if is_err { "error".into() } else { "completed".into() },
                         result: Some(result),
                     };
-                    let _ = app.emit(&format!("conv-tool:{pty_id}"), &tc);
+                    emit_all(app, &format!("conv-tool:{pty_id}"), &tc);
                 }
             }
             if had_result {
@@ -240,7 +242,7 @@ fn claude_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut 
             tool_calls: vec![],
             usage: None,
         };
-        let _ = app.emit(&format!("conv-msg:{pty_id}"), &m);
+        emit_all(app, &format!("conv-msg:{pty_id}"), &m);
     }
 }
 
@@ -407,7 +409,7 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
                 offset = 0;
                 state = ClaudeState::default();
                 pending.clear();
-                let _ = app.emit(&format!("conv-reset:{pty_id}"), ());
+                emit_all(&app, &format!("conv-reset:{pty_id}"), ());
             }
         }
         let Some(path) = cur_path.clone() else { continue };
@@ -468,9 +470,9 @@ fn claude_watch(app: AppHandle, pty_id: u32, cwd: String) {
             // Once native hooks are live for this pty they own status/activity/todos;
             // the watcher then contributes only token context (and conversation).
             if crate::hook_server::hooks_active(&app, pty_id) {
-                let _ = app.emit(&evt, serde_json::json!({ "context": prog.context }));
+                emit_all(&app, &evt, serde_json::json!({ "context": prog.context }));
             } else {
-                let _ = app.emit(&evt, &prog);
+                emit_all(&app, &evt, &prog);
             }
         }
     }
@@ -670,7 +672,9 @@ impl ClaudeState {
     fn signature(&self, p: &AgentProgress) -> String {
         let done = p.todos.iter().filter(|t| t.status == "completed").count();
         let last_ts = self.tools.last().map(|t| t.ts.as_str()).unwrap_or("");
-        let todo_sig: String = p.todos.iter().map(|t| t.status.chars().next().unwrap_or('?')).collect();
+        // include the task TEXT, not just status, so a revised plan (same statuses,
+        // different steps) re-emits and the rail re-syncs.
+        let todo_sig: String = p.todos.iter().map(|t| format!("{}/{};", t.text, t.status)).collect();
         format!(
             "{}|{}|{}/{}|{}|{}|{}|{}",
             p.status,
@@ -866,7 +870,7 @@ fn codex_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut H
                 tool_calls: vec![ConvToolCall { id: cid, name, summary, status: "running".into(), result: None }],
                 usage: None,
             };
-            let _ = app.emit(&format!("conv-msg:{pty_id}"), &m);
+            emit_all(app, &format!("conv-msg:{pty_id}"), &m);
         }
         "function_call_output" | "execution_result" => {
             let cid = p["call_id"].as_str().or_else(|| p["id"].as_str()).unwrap_or("").to_string();
@@ -879,7 +883,7 @@ fn codex_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut H
                 status: "completed".into(),
                 result: Some(truncate_str(out, 4000)),
             };
-            let _ = app.emit(&format!("conv-tool:{pty_id}"), &tc);
+            emit_all(app, &format!("conv-tool:{pty_id}"), &tc);
         }
         "reasoning" => {
             let t = codex_collect_text(p);
@@ -893,7 +897,7 @@ fn codex_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut H
                     tool_calls: vec![],
                     usage: None,
                 };
-                let _ = app.emit(&format!("conv-msg:{pty_id}"), &m);
+                emit_all(app, &format!("conv-msg:{pty_id}"), &m);
             }
         }
         _ => {
@@ -910,7 +914,7 @@ fn codex_conv_from_line(app: &AppHandle, pty_id: u32, v: &Value, pending: &mut H
                         tool_calls: vec![],
                         usage: None,
                     };
-                    let _ = app.emit(&format!("conv-msg:{pty_id}"), &m);
+                    emit_all(app, &format!("conv-msg:{pty_id}"), &m);
                 }
             }
         }
@@ -941,7 +945,7 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
                 offset = 0;
                 state = CodexState::default();
                 pending.clear();
-                let _ = app.emit(&format!("conv-reset:{pty_id}"), ());
+                emit_all(&app, &format!("conv-reset:{pty_id}"), ());
             }
         }
         let Some(path) = cur.clone() else { continue };
@@ -986,9 +990,9 @@ fn codex_watch(app: AppHandle, pty_id: u32, cwd: String) {
             // Once native hooks are live for this pty they own status/activity/todos;
             // the watcher then contributes only token context (and conversation).
             if crate::hook_server::hooks_active(&app, pty_id) {
-                let _ = app.emit(&evt, serde_json::json!({ "context": prog.context }));
+                emit_all(&app, &evt, serde_json::json!({ "context": prog.context }));
             } else {
-                let _ = app.emit(&evt, &prog);
+                emit_all(&app, &evt, &prog);
             }
         }
     }
@@ -1111,7 +1115,8 @@ impl CodexState {
     }
     fn signature(&self, p: &AgentProgress) -> String {
         let last_ts = self.tools.last().map(|t| t.ts.as_str()).unwrap_or("");
-        let todo_sig: String = self.todos.iter().map(|t| t.status.chars().next().unwrap_or('?')).collect();
+        // include task TEXT (not just status) so a revised codex plan re-syncs.
+        let todo_sig: String = self.todos.iter().map(|t| format!("{}/{};", t.text, t.status)).collect();
         format!("{}|{}|{}|{}|{}|{}|{}", p.status, p.activity, self.tools.len(), last_ts, self.used_tokens, self.todos.len(), todo_sig)
     }
 }
@@ -1332,7 +1337,7 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
                 tool_calls: vec![],
                 usage: None,
             };
-            let _ = app.emit(&format!("conv-msg:{pty_id}"), &m);
+            emit_all(&app, &format!("conv-msg:{pty_id}"), &m);
         }
 
         let prog = state.to_progress();
@@ -1342,9 +1347,9 @@ fn opencode_watch(app: AppHandle, pty_id: u32, cwd: String) {
             // Once native hooks are live for this pty they own status/activity/todos;
             // the watcher then contributes only token context (and conversation).
             if crate::hook_server::hooks_active(&app, pty_id) {
-                let _ = app.emit(&evt, serde_json::json!({ "context": prog.context }));
+                emit_all(&app, &evt, serde_json::json!({ "context": prog.context }));
             } else {
-                let _ = app.emit(&evt, &prog);
+                emit_all(&app, &evt, &prog);
             }
         }
     }

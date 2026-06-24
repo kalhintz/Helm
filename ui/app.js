@@ -356,8 +356,15 @@
       pushTimeline(session, "셸 시작됨", "green");
 
       const unData = await listen(`pty-data:${ptyId}`, (e) => {
-        if (session.term) session.term.write(b64ToBytes(e.payload.b64));
+        const bytes = b64ToBytes(e.payload.b64);
+        if (session.term) session.term.write(bytes);
         session.lastOutput = Date.now();
+        // an agent's full-screen TUI restores the main screen buffer on exit
+        // (\x1b[?1049l / \x1b[?47l) — when that lands and an agent was running,
+        // the shell is back, so drop the agent label and stop its watcher.
+        if (session.launch && session._watch && altScreenExited(bytes)) {
+          revertToShell(session);
+        }
       });
       const unExit = await listen(`pty-exit:${ptyId}`, () => {
         session.status = "exited";
@@ -723,6 +730,28 @@
       session._watch = key;
       invoke("start_agent_watch", { id: session.ptyId, agent: key, cwd: session.cwd }).catch(() => {});
     }
+  }
+  function altScreenExited(bytes) {
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return s.includes("\x1b[?1049l") || s.includes("\x1b[?47l");
+  }
+  // An agent CLI was Ctrl+C'd / quit and the bare shell is back: drop the agent
+  // label, stop its watcher, and clear its progress so the rail re-syncs.
+  function revertToShell(session) {
+    if (!session || !session.launch) return;
+    const shellKey = session.shell === "cmd" ? "cmd" : session.shell === "wsl" ? "wsl" : "pwsh";
+    const a = AGENTS[shellKey];
+    session.agent = shellKey;
+    session.agentLabel = a.label;
+    session.accent = a.accent;
+    session.launch = null;
+    session._watch = null;
+    session.progress = null;
+    session.tags = [];
+    pushTimeline(session, a.label + " (에이전트 종료)", "blue");
+    App.renderLeft();
+    if (store.activeId === session.id) { showSession(session.id); App.renderRight(); }
   }
   function detectAgentFromText(s) {
     const t = (s || "").toLowerCase();
@@ -1204,6 +1233,25 @@
 
     const gear = $("#tb-gear");
     if (gear) gear.addEventListener("click", openSettings);
+
+    const mob = $("#tb-mobile");
+    if (mob) mob.addEventListener("click", async () => {
+      try {
+        const info = await invoke("mobile_info");
+        const u = $("#mob-url"); if (u) u.value = info.url || "";
+        const set = (id, v) => { const e = $("#" + id); if (e) e.textContent = v; };
+        set("mob-ip", info.lan_ip || "—");
+        set("mob-http", info.http_port || "—");
+        set("mob-ws", info.ws_port || "—");
+      } catch (_) {}
+      const m = $("#mobile-modal"); if (m) m.hidden = false;
+    });
+    const mClose = $("#mob-close");
+    if (mClose) mClose.addEventListener("click", () => { const m = $("#mobile-modal"); if (m) m.hidden = true; });
+    const mCopy = $("#mob-copy");
+    if (mCopy) mCopy.addEventListener("click", () => { const u = $("#mob-url"); if (u) { u.select(); clipWriteText(u.value); } });
+    const mModal = $("#mobile-modal");
+    if (mModal) mModal.addEventListener("click", (e) => { if (e.target === mModal) mModal.hidden = true; });
 
     try {
       const getWin = TAURI.window && TAURI.window.getCurrentWindow;

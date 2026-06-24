@@ -4,6 +4,36 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.3.0] — 2026-06-24
+
+Mobile access over the LAN, plus much more robust live agent tracking that no
+longer depends on any plugin being installed.
+
+### Added
+
+- **Mobile (Phase A, LAN)** — a 📱 button shows a URL/QR for a phone on the same
+  wifi. Helm serves the identical UI over HTTP and bridges it over a WebSocket:
+  the phone drives sessions live (terminal, progress, tasks, conversation) with
+  a per-launch pairing token. No new dependencies — a hand-rolled std HTTP + WS
+  server, the same event stream the desktop uses.
+
+### Changed
+
+- **Robust agent tracking without any plugin** — Claude's transcript is now found
+  by scanning all project dirs for the newest one whose recorded cwd matches the
+  session (Claude often writes under a git-root slug, not the cwd slug), so
+  progress/tasks/context work for vanilla Claude. OMC's HUD cache and the hook's
+  exact transcript path are used as faster sources when present, never required.
+- The task list re-syncs when an agent revises its plan (the change signature now
+  tracks task text, not just status), and the right-rail task list scrolls.
+
+### Fixed
+
+- Codex's cursor no longer flickers while it works (its TUI repaints hard, so the
+  cursor is pinned steady for Codex sessions).
+- When an agent CLI exits back to the shell, the session drops the agent label and
+  stops its watcher instead of staying stuck on the agent.
+
 ## [0.2.0] — 2026-06-24
 
 Live agent state goes from log-tailing to native hooks, plus a redesigned tasks
@@ -83,5 +113,6 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.3.0]: https://github.com/kalhintz/Helm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kalhintz/Helm/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kalhintz/Helm/releases/tag/v0.1.0
