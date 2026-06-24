@@ -385,11 +385,16 @@ fn start_agent_watch(app: AppHandle, id: u32, agent: String, cwd: String) {
             if let Some(fwd) = hook_server::forwarder_path().to_str() {
                 hook_server::register_claude(&cwd, port, fwd);
             }
+        } else if agent == "codex" {
+            // Codex reads a global ~/.codex/hooks.json. register_codex merges our
+            // forwarder into root["hooks"] only, preserving the top-level "state"
+            // trust store; Codex's one-time TUI prompt trusts the new hook.
+            if let Some(fwd) = hook_server::forwarder_path().to_str() {
+                hook_server::register_codex(port, fwd);
+            }
         } else if agent == "opencode" {
             // opencode auto-loads our plugin from its global plugin/ dir; this just
-            // (re)writes it with the current receiver port. (Codex is intentionally
-            // left on the watcher — auto-editing its global hooks.json + trust store
-            // is too risky.)
+            // (re)writes it with the current receiver port.
             hook_server::register_opencode(port);
         }
     }

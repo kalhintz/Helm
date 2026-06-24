@@ -784,3 +784,137 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .mob-meta { display: flex; gap: 16px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); margin-bottom: 12px; }
 .mob-meta b { color: var(--text-dim); font-family: var(--mono-font); }
 .mob-note { font-size: 11px; color: var(--muted-2); margin: 0; line-height: 1.5; }
+
+/* ======================================================================
+   RESPONSIVE — phone & tablet (mobile bridge / shared codebase)
+   Desktop (>=901px) is untouched: everything below lives in @media only.
+   Tiers:  <=900px tablet  ·  <=640px phone
+   ====================================================================== */
+
+/* ---------- TABLET & PHONE shared (<=900px) ---------- */
+@media (max-width: 900px) {
+  html, body { overflow-x: hidden; }
+
+  #app-shell {
+    grid-template-columns: 100%;
+    position: relative;
+    overflow: hidden;
+  }
+
+  #center { grid-column: 1 / -1; width: 100%; }
+
+  #left-rail {
+    position: absolute;
+    top: 0; left: 0; bottom: 0;
+    width: min(86vw, 320px);
+    z-index: 70;
+    transform: translateX(-101%);
+    transition: transform 180ms ease;
+    box-shadow: var(--shadow-pop);
+    will-change: transform;
+  }
+  body.mnav-open #left-rail { transform: translateX(0); }
+
+  #right-rail {
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: min(86vw, 340px);
+    z-index: 70;
+    transform: translateX(101%);
+    transition: transform 180ms ease;
+    box-shadow: var(--shadow-pop);
+    will-change: transform;
+  }
+  body.mstat-open #right-rail { transform: translateX(0); }
+
+  #app-shell::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: rgba(0,0,0,0.5);
+    opacity: 0; pointer-events: none;
+    transition: opacity 180ms ease;
+    z-index: 65;
+  }
+  body.mnav-open #app-shell::after,
+  body.mstat-open #app-shell::after { opacity: 1; pointer-events: auto; }
+
+  .m-drawer-btn {
+    width: 34px; height: 30px;
+    border-radius: var(--r-sm);
+    display: grid; place-items: center;
+    color: var(--muted); font-size: 17px; line-height: 1;
+    transition: color var(--t-fast), background var(--t-fast);
+  }
+  .m-drawer-btn:hover { color: var(--text); background: #1b1f25; }
+  #m-nav-btn { margin-right: 2px; }
+
+  #topbar { gap: var(--sp-3); padding: 0 var(--sp-3); }
+  .tb-brand { display: none; }
+  .wc-group { display: none; }
+
+  #page-header { padding: 0 var(--sp-4); }
+  .ph-chips {
+    overflow-x: auto; overflow-y: hidden;
+    flex-wrap: nowrap; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .ph-chips::-webkit-scrollbar { display: none; }
+
+  .cx-tab { padding-top: 8px; padding-bottom: 8px; }
+}
+
+/* drawer toggles must NEVER show on desktop */
+@media (min-width: 901px) {
+  .m-drawer-btn { display: none !important; }
+}
+
+/* ---------- PHONE (<=640px) ---------- */
+@media (max-width: 640px) {
+  #left-rail  { width: min(92vw, 340px); }
+  #right-rail { width: min(92vw, 360px); }
+
+  #cx-textarea-row { flex-direction: column; align-items: stretch; gap: 6px; }
+  #cx-input {
+    min-height: 44px;
+    font-size: 16px;
+    line-height: 1.4;
+  }
+  #cx-send-btn {
+    width: 100%; height: 42px;
+    font-size: 13px;
+  }
+  .cx-send-hint { display: none; }
+  #cx-composer-top { flex-wrap: wrap; gap: 6px; row-gap: 4px; }
+  #cx-composer { padding: 8px 10px 10px; }
+
+  #cx-title-row { padding: 8px 10px 5px; }
+  #cx-subheader { padding: 0 10px 8px; }
+  .cx-icon-btn { width: 30px; height: 30px; }
+  #cx-msg-count { display: none; }
+
+  .cx-term-slot { padding: 4px 2px 2px 4px; }
+
+  #topbar { padding: 0 6px; gap: 6px; }
+  .tb-tab { padding: 0 10px; }
+  .conn-pill .conn-label { display: none; }
+  .conn-pill { padding: 0 8px; }
+  .tb-right { gap: 4px; }
+
+  #todos-view { padding: 16px 14px 40px; }
+  .tv-list { grid-template-columns: 1fr; }
+  .tv-card { padding: 11px 12px 12px; }
+
+  .modal { width: 96vw; max-width: 96vw; }
+  .modal-body { max-height: 70vh; }
+  .set-checks { grid-template-columns: 1fr; }
+
+  .ns-menu { max-width: 92vw; }
+
+  .tb-dropdown { right: 8px; left: auto; width: min(92vw, 320px); }
+}
+
+/* very narrow (<=380px): tighten the topbar tabs a touch more */
+@media (max-width: 380px) {
+  .tb-tab { padding: 0 7px; font-size: var(--fs-12); }
+  #topbar { gap: 4px; }
+}

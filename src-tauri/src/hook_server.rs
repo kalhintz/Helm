@@ -400,3 +400,53 @@ fn group_mentions(group: &Value, forwarder: &str) -> bool {
         })
         .unwrap_or(false)
 }
+
+/// Register Helm's forwarder in the global `~/.codex/hooks.json` so Codex pushes
+/// lifecycle events to our receiver (mirrors register_claude's read/merge/append).
+///
+/// SAFETY: that file's top-level `"state"` key is a LIVE Codex-managed trust store
+/// — we read the WHOLE root, mutate ONLY `root["hooks"]`, and write the whole root
+/// back, so `"state"` and every OMX group survive. We never write trust hashes;
+/// Codex's one-time interactive TUI prompt approves the new hook.
+pub fn register_codex(_port: u16, forwarder: &str) {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    if home.is_empty() {
+        return;
+    }
+    let path = std::path::Path::new(&home).join(".codex").join("hooks.json");
+    let cmd = json!({ "type": "command", "command": format!("\"{forwarder}\""), "timeout": 5 });
+    let group = json!({ "matcher": "*", "hooks": [cmd] });
+    let events = [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "Notification",
+        "SubagentStop",
+    ];
+    let mut root: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
+        .filter(|v: &Value| v.is_object())
+        .unwrap_or_else(|| json!({}));
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    if let Some(h) = hooks.as_object_mut() {
+        for ev in events {
+            let arr = h.entry(ev).or_insert_with(|| json!([]));
+            if let Some(list) = arr.as_array_mut() {
+                list.retain(|g| !group_mentions(g, forwarder));
+                list.push(group.clone());
+            } else {
+                *arr = json!([group]);
+            }
+        }
+    }
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap_or_default());
+}

@@ -4,6 +4,26 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.4.0] — 2026-06-24
+
+Codex joins the native-hook pipeline (all three agents now push live state with
+no polling), and the mobile UI gets a real phone layout.
+
+### Added
+
+- **Codex native hooks** — Codex now pushes its lifecycle events to Helm's
+  localhost receiver through `~/.codex/hooks.json`, so its progress, activity, and
+  completion appear instantly like Claude and opencode. Registration merges only
+  the hook entries and leaves Codex's trust store untouched; Codex's own one-time
+  trust prompt authorizes the new hook. This completes instant, poll-free tracking
+  for all three agents.
+- **Mobile phone layout** — on a phone the three-pane dashboard collapses to a
+  single full-width column with the terminal/conversation as the focus; the
+  session list and the session-status rail become slide-in drawers reached from a
+  hamburger and a status button. Horizontal overflow is locked, the composer is
+  zoom-safe on iOS, and modals become full-width sheets. The desktop layout is
+  unchanged.
+
 ## [0.3.0] — 2026-06-24
 
 Mobile access over the LAN, plus much more robust live agent tracking that no
@@ -113,6 +133,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.4.0]: https://github.com/kalhintz/Helm/releases/tag/v0.4.0
 [0.3.0]: https://github.com/kalhintz/Helm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/kalhintz/Helm/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kalhintz/Helm/releases/tag/v0.1.0

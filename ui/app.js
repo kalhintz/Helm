@@ -1263,6 +1263,62 @@
         if (close) close.addEventListener("click", () => win.close());
       }
     } catch (_) {}
+
+    // ---- mobile drawer toggles (no-op on desktop; buttons hidden via CSS) ----
+    (function mobileDrawers() {
+      const nav = document.getElementById("tb-nav");
+      const right = document.querySelector(".tb-right");
+      const body = document.body;
+      const closeAll = () => body.classList.remove("mnav-open", "mstat-open");
+
+      // hamburger -> left rail (session list), placed before the 세션/작업 tabs
+      if (nav && !document.getElementById("m-nav-btn")) {
+        const b = document.createElement("button");
+        b.id = "m-nav-btn";
+        b.className = "m-drawer-btn";
+        b.type = "button";
+        b.title = "세션 목록";
+        b.setAttribute("aria-label", "세션 목록 열기");
+        b.innerHTML = "&#9776;"; // ☰
+        b.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const open = body.classList.contains("mnav-open");
+          closeAll();
+          if (!open) body.classList.add("mnav-open");
+        });
+        nav.parentNode.insertBefore(b, nav);
+      }
+
+      // status icon -> right rail (세션 상태), placed first in .tb-right
+      if (right && !document.getElementById("m-stat-btn")) {
+        const b = document.createElement("button");
+        b.id = "m-stat-btn";
+        b.className = "m-drawer-btn";
+        b.type = "button";
+        b.title = "세션 상태";
+        b.setAttribute("aria-label", "세션 상태 열기");
+        b.innerHTML = "&#128202;"; // 📊
+        b.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const open = body.classList.contains("mstat-open");
+          closeAll();
+          if (!open) body.classList.add("mstat-open");
+        });
+        right.insertBefore(b, right.firstChild);
+      }
+
+      // tap the scrim, or pick a session, to close the drawer
+      const shell = document.getElementById("app-shell");
+      if (shell) shell.addEventListener("click", (e) => {
+        if (body.classList.contains("mnav-open") || body.classList.contains("mstat-open")) {
+          const inLeft = e.target.closest("#left-rail");
+          const inRight = e.target.closest("#right-rail");
+          if (!inLeft && !inRight) closeAll();                    // tapped scrim/center
+          else if (inLeft && e.target.closest(".lr-row")) closeAll(); // picked a session
+        }
+      });
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAll(); });
+    })();
   }
 
   /* ================================================================
