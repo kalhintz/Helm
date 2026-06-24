@@ -1230,6 +1230,7 @@
   function buildRow(s) {
     const row = el("div", "lr-row" + (s.id === store.activeId ? " selected" : "") + (s.status === "attention" ? " attention" : "") + (s.progress && s.progress.status === "working" ? " agent-working" : ""));
     row.dataset.id = s.id;
+    row.dataset.sid = s.id;
     row.dataset.status = s.status;
     row.setAttribute("role", "option");
     row.addEventListener("click", () => selectSession(s.id));
@@ -1278,6 +1279,7 @@
     store.sessions.forEach((s) => {
       const tab = el("div", "cx-tab" + (s.id === store.activeId ? " active" : "") + (s.status === "attention" ? " attention" : ""));
       tab.dataset.id = s.id;
+      tab.dataset.sid = s.id;
       tab.title = (s.agentLabel || s.shell || "") + " — " + s.title;
       tab.appendChild(el("span", "cx-tab-ic ag-" + (s.agent || "pwsh"), agentIcon(s.agent)));
       tab.appendChild(el("span", "cx-tab-title", s.title));
@@ -1686,6 +1688,7 @@
     completedPlans.forEach((p) => {
       const accent = PLAN_AGENT_ACCENT[p.agent] || "blue";
       const card = el("div", "pv-card");
+      card.dataset.pid = p.plan_id || "";
       const head = el("div", "pv-head");
       head.appendChild(el("span", "pv-badge is-" + accent, PLAN_AGENT_BADGE[p.agent] || (p.agent || "?").toUpperCase()));
       head.appendChild(el("span", "pv-title", p.title || "계획"));
@@ -2220,6 +2223,201 @@
   }
 
   /* ================================================================
+     CONTEXT MENU — zone-aware right-click. One global listener always
+     preventDefaults so WebView2's native menu never appears; buildCtxMenu
+     routes by the clicked zone and returns an item list, showCtxMenu paints
+     it (clamped to the viewport) and wires the close behaviors. Item model:
+     { label, action, danger, disabled, sep }.
+     ================================================================ */
+  let _ctxMenuEl = null;
+  let _ctxCleanup = null;
+  function closeCtxMenu() {
+    if (_ctxCleanup) { _ctxCleanup(); _ctxCleanup = null; }
+    if (_ctxMenuEl) { _ctxMenuEl.remove(); _ctxMenuEl = null; }
+  }
+  function showCtxMenu(x, y, items) {
+    closeCtxMenu();
+    const menu = el("div", "ctx-menu");
+    items.forEach((it) => {
+      if (it.sep) { menu.appendChild(el("div", "ctx-sep")); return; }
+      const mi = el("div", "ctx-item" + (it.danger ? " danger" : "") + (it.disabled ? " disabled" : ""), it.label);
+      if (!it.disabled) {
+        mi.addEventListener("click", () => { closeCtxMenu(); try { it.action && it.action(); } catch (_) {} });
+      }
+      menu.appendChild(mi);
+    });
+    document.body.appendChild(menu);
+    // clamp into the viewport (measure after append so width/height are real)
+    const w = menu.offsetWidth, h = menu.offsetHeight;
+    let left = x, top = y;
+    if (left + w > window.innerWidth) left = Math.max(4, window.innerWidth - w - 4);
+    if (top + h > window.innerHeight) top = Math.max(4, window.innerHeight - h - 4);
+    menu.style.left = left + "px";
+    menu.style.top = top + "px";
+    _ctxMenuEl = menu;
+    const onDown = (e) => { if (!menu.contains(e.target)) closeCtxMenu(); };
+    const onKey = (e) => { if (e.key === "Escape") closeCtxMenu(); };
+    const onScroll = () => closeCtxMenu();
+    const onBlur = () => closeCtxMenu();
+    setTimeout(() => document.addEventListener("mousedown", onDown, true), 0);
+    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("blur", onBlur);
+    _ctxCleanup = () => {
+      document.removeEventListener("mousedown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("blur", onBlur);
+    };
+  }
+
+  // Pull every fenced ``` block's body out of a message and concatenate it.
+  function extractFencedCode(text) {
+    const out = [];
+    const re = /```[^\n]*\n?([\s\S]*?)```/g;
+    let m;
+    while ((m = re.exec(text || ""))) out.push(m[1].replace(/\n+$/, ""));
+    return out.join("\n\n");
+  }
+
+  function ctxTerminalItems() {
+    const s = activeSession();
+    if (!s) return [];
+    const sel = !!(s.term && s.term.hasSelection && s.term.hasSelection());
+    const isAgent = s.agent === "claude" || s.agent === "codex" || s.agent === "opencode";
+    const items = [
+      { label: "복사", disabled: !sel, action: () => { if (s.term) clipWriteText(s.term.getSelection()); } },
+      { label: "붙여넣기", action: () => clipReadText().then((t) => { if (t && s.term) s.term.paste(t); }) },
+      { label: "이미지 붙여넣기", action: () => invoke("paste_clipboard_image").then((p) => { if (p && s.term) s.term.paste(p); }).catch(() => {}) },
+      { label: "전체 선택", action: () => { if (s.term) try { s.term.selectAll(); } catch (_) {} } },
+      { sep: true },
+      { label: "스크롤백 지우기", action: () => { if (s.term) try { s.term.clear(); } catch (_) {} } },
+      { label: "작업 폴더 열기", disabled: !s.cwd, action: () => invoke("open_path", { path: s.cwd || "" }).catch(() => {}) },
+      { label: "경로 복사", disabled: !s.cwd, action: () => clipWriteText(s.cwd || "") },
+      { sep: true },
+      { label: "중단 보내기", disabled: s.ptyId == null, action: () => { if (s.ptyId != null) invoke("pty_write", { id: s.ptyId, data: "" }).catch(() => {}); } },
+    ];
+    if (isAgent) items.push({ label: "/clear 보내기", disabled: s.ptyId == null, action: () => sendCmd("/clear") });
+    return items;
+  }
+
+  // Replace a row/tab title element with an input prefilled with the session
+  // title; Enter commits via renameSession, Esc/blur cancels. Self-contained.
+  function ctxInlineRename(s, labelEl) {
+    if (!s || !labelEl) return;
+    const input = el("input", "ctx-rename-input");
+    input.type = "text";
+    input.value = s.title || "";
+    input.spellcheck = false;
+    let done = false;
+    const finish = (commit) => {
+      if (done) return; done = true;
+      const v = input.value.trim();
+      if (commit && v) renameSession(s.id, v); else renderLeft();
+    };
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") { e.preventDefault(); finish(true); }
+      else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener("blur", () => finish(true));
+    labelEl.replaceWith(input);
+    input.focus();
+    try { input.select(); } catch (_) {}
+  }
+
+  function ctxSessionRowItems(row) {
+    const s = sessionById(row.dataset.sid);
+    if (!s) return [];
+    return [
+      { label: "이름 변경", action: () => { const lbl = row.querySelector(".lr-title"); if (lbl) ctxInlineRename(s, lbl); } },
+      { label: s.pinned ? "고정 해제" : "고정", action: () => togglePin(s.id) },
+      { label: "복제", action: () => newSession({ agent: s.agent, cwd: s.cwd }) },
+      { label: "여기서 새 세션", action: () => newSession({ agent: s.agent, cwd: s.cwd }) },
+      { sep: true },
+      { label: "폴더 열기", disabled: !s.cwd, action: () => invoke("open_path", { path: s.cwd || "" }).catch(() => {}) },
+      { label: "경로 복사", disabled: !s.cwd, action: () => clipWriteText(s.cwd || "") },
+      { sep: true },
+      { label: "닫기", danger: true, action: () => closeSession(s.id) },
+    ];
+  }
+
+  function ctxConvMsgItems(node) {
+    const s = activeSession();
+    if (!s) return [];
+    const m = (s.transcript || []).find((x) => x.id === node.dataset.mid);
+    if (!m) return [];
+    const text = m.text || "";
+    const code = extractFencedCode(text);
+    const hasImages = !!(m.images && m.images.length);
+    const items = [
+      { label: "메시지 복사", action: () => clipWriteText(text) },
+      { label: "코드 복사", disabled: !code, action: () => clipWriteText(code) },
+    ];
+    if (m.role === "user") items.push({ label: "다시 보내기", action: () => sendCmd(text) });
+    items.push({ label: "터미널로 보내기", disabled: s.ptyId == null, action: () => { if (s.ptyId != null) invoke("pty_write", { id: s.ptyId, data: text }).catch(() => {}); } });
+    if (hasImages) {
+      items.push({ sep: true });
+      items.push({ label: "이미지 크게 보기", action: () => openImageLightbox(m.images, 0) });
+      items.push({ label: "이미지 복사", action: () => clipWriteImage(m.images[0]).then((ok) => { if (!ok && m.images[0] && m.images[0].data_uri) clipWriteText(m.images[0].data_uri); }) });
+    }
+    return items;
+  }
+
+  function ctxTabItems(tab) {
+    const s = sessionById(tab.dataset.sid);
+    if (!s) return [];
+    return [
+      { label: "이름 변경", action: () => { const lbl = tab.querySelector(".cx-tab-title"); if (lbl) ctxInlineRename(s, lbl); } },
+      { label: "복제", action: () => newSession({ agent: s.agent, cwd: s.cwd }) },
+      { sep: true },
+      { label: "닫기", action: () => closeSession(s.id) },
+      { label: "다른 탭 닫기", action: () => { store.sessions.map((o) => o.id).filter((id) => id !== s.id).forEach((id) => closeSession(id)); } },
+    ];
+  }
+
+  function ctxPlanCardItems(card) {
+    const p = completedPlans.find((x) => x.plan_id === card.dataset.pid);
+    if (!p) return [];
+    return [
+      { label: "▶ 바로 실행", action: () => executePlan(p) },
+      { label: "계획 복사", action: () => clipWriteText(p.plan || "") },
+      { sep: true },
+      { label: "삭제", danger: true, action: () => {
+        const i = completedPlans.indexOf(p);
+        if (i >= 0) { completedPlans.splice(i, 1); savePlans(); renderPlansView(); }
+      } },
+    ];
+  }
+
+  function buildCtxMenu(e) {
+    const t = e.target;
+    const conv = t.closest && t.closest(".conv-msg");
+    if (conv) return ctxConvMsgItems(conv);
+    const plan = t.closest && t.closest(".pv-card");
+    if (plan) return ctxPlanCardItems(plan);
+    const row = t.closest && t.closest(".lr-row");
+    if (row) return ctxSessionRowItems(row);
+    const tab = t.closest && t.closest(".cx-tab");
+    if (tab) return ctxTabItems(tab);
+    const term = t.closest && (t.closest(".cx-term-slot") || t.closest(".xterm"));
+    if (term) return ctxTerminalItems();
+    return [
+      { label: "새 세션", action: () => openNew($("#lr-new-session") || document.body) },
+      { label: "설정", action: () => openSettings() },
+    ];
+  }
+
+  function wireContextMenu() {
+    document.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      const items = buildCtxMenu(e);
+      if (items && items.length) showCtxMenu(e.clientX, e.clientY, items);
+      else closeCtxMenu();
+    }, true);
+  }
+
+  /* ================================================================
      Public surface
      ================================================================ */
   const App = {
@@ -2283,6 +2481,7 @@
     loadPlans();
     wireTopbar();
     wireShortcuts();
+    wireContextMenu();
     wireHeader();
     wireLeft();
     wireCenter();

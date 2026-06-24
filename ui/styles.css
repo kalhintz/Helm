@@ -905,6 +905,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .cx-quick-mi { text-align: left; font-size: 12px; color: var(--text-dim); background: transparent; border: none; border-radius: var(--r-sm); padding: 6px 10px; cursor: pointer; }
 .cx-quick-mi:hover { background: var(--accent-soft); color: var(--text); }
 
+/* zone-aware right-click context menu */
+.ctx-menu { position: fixed; z-index: 2000; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md); box-shadow: var(--shadow-pop); padding: 4px; min-width: 190px; font-size: var(--fs-12); }
+.ctx-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--r-sm); cursor: pointer; color: var(--text-dim); white-space: nowrap; }
+.ctx-item:hover { background: var(--panel-hi); color: var(--text); }
+.ctx-item.danger { color: var(--red); }
+.ctx-item.disabled { color: var(--muted-2); pointer-events: none; opacity: .55; }
+.ctx-sep { height: 1px; margin: 4px 6px; background: var(--border); }
+.ctx-rename-input { width: 100%; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: var(--r-sm); padding: 2px 6px; font-size: var(--fs-12); font-family: inherit; }
+
 /* opencode mode + model chip (composer quick-controls) */
 .cx-mode-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted);
   background: var(--secondary); border: 1px solid var(--border); border-radius: var(--r-pill);

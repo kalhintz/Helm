@@ -4,6 +4,22 @@ All notable changes to Helm are documented here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions follow
 [Semantic Versioning](https://semver.org).
 
+## [0.9.0] — 2026-06-25
+
+### Added
+
+- **Context-aware right-click menu** — right-click now opens a native menu whose
+  items depend on where you click, replacing the default webview menu:
+  - **Terminal** — copy / paste / paste image / select all / clear scrollback,
+    open the working folder, copy its path, send interrupt, send `/clear`.
+  - **Session row** — inline rename, pin, duplicate, new session here, open folder,
+    copy path, close.
+  - **Conversation message** — copy message / copy code, re-send (your own
+    messages), send to terminal, view image large / copy image.
+  - **Tab** — rename, duplicate, close, close others.
+  - **Plan card** — run now, copy plan, delete.
+  - Anywhere else — new session, settings.
+
 ## [0.8.1] — 2026-06-25
 
 Performance and code-weight pass — same behavior, lighter and faster.
@@ -240,6 +256,7 @@ beside the terminal.
 - Built on Tauri (Rust) + the system webview + ConPTY/PTY. No Electron.
 - MIT licensed.
 
+[0.9.0]: https://github.com/kalhintz/Helm/releases/tag/v0.9.0
 [0.8.1]: https://github.com/kalhintz/Helm/releases/tag/v0.8.1
 [0.8.0]: https://github.com/kalhintz/Helm/releases/tag/v0.8.0
 [0.7.0]: https://github.com/kalhintz/Helm/releases/tag/v0.7.0

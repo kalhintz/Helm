@@ -391,6 +391,31 @@ fn listening_ports() -> Vec<u16> {
     }
 }
 
+/// Open a folder or file in the OS file manager (Explorer / Finder / xdg-open).
+/// Empty path is a no-op. On Windows the launch goes through explorer.exe with
+/// CREATE_NO_WINDOW so no console flashes.
+#[tauri::command]
+fn open_path(path: String) {
+    if path.trim().is_empty() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(&path)
+            .creation_flags(NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+    }
+}
+
 /// Current git branch for a directory (for the sidebar row), or None.
 #[tauri::command]
 fn git_branch(cwd: String) -> Option<String> {
@@ -907,6 +932,7 @@ fn main() {
             app_home,
             app_selftest,
             git_branch,
+            open_path,
             listening_ports,
             system_stats,
             start_agent_watch,
